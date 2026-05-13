@@ -10,6 +10,7 @@ node_modules/
 install.log
 install.err
 *.log
+.release-staging/
 .DS_Store
 Thumbs.db
 
