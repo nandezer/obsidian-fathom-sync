@@ -1,0 +1,26 @@
+# Build artefacts
+main.js
+main.js.map
+*.tsbuildinfo
+
+# Dependencies
+node_modules/
+
+# Temp / local
+install.log
+install.err
+*.log
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+
+# Test vault data (in case anyone tests in a vault checked into this repo)
+.obsidian/
+
+# Release zips kept under releases/ are fine; ignore ad-hoc zips at root
+/fathom-sync-*.zip

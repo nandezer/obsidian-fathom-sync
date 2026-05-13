@@ -1,0 +1,10 @@
+{
+  "id": "fathom-sync",
+  "name": "Fathom Sync",
+  "version": "1.0.0",
+  "minAppVersion": "1.5.7",
+  "description": "Sync Fathom meeting summaries and transcripts to your vault.",
+  "author": "Plugin Author",
+  "authorUrl": "https://example.com",
+  "isDesktopOnly": true
+}
