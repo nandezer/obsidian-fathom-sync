@@ -618,6 +618,24 @@ export class FathomSyncSettingTab extends PluginSettingTab {
     webhookId: string,
     secret: string
   ): Promise<void> {
+    // Defensive: createWebhook should already have rejected an empty/missing
+    // secret, but guard here too so a future regression can't crash the UI
+    // mid-flow and leave the user wondering whether the webhook was made.
+    if (typeof secret !== "string" || secret.length === 0) {
+      logger.error(
+        "Webhook was registered but Fathom returned no signing secret. " +
+          "Webhook id:",
+        webhookId
+      );
+      new Notice(
+        `Fathom Sync: webhook registered (id ${webhookId.slice(0, 8)}…) but ` +
+          `Fathom did not return a signing secret. Delete the webhook and ` +
+          `try again, or check the developer console.`,
+        20000
+      );
+      return;
+    }
+
     let copied = false;
     try {
       await navigator.clipboard.writeText(secret);

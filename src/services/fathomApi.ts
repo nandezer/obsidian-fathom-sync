@@ -266,11 +266,24 @@ export class FathomApiClient {
       include_action_items: opts.includeActionItems ?? true,
       include_crm_matches: opts.includeCrmMatches ?? false,
     };
-    return this.callMutate<{ id: string; signing_secret: string }>(
-      "POST",
-      "/webhooks",
-      body
-    );
+    // Fathom returns the signing key in a field literally called `secret` —
+    // not `signing_secret` like the earlier code assumed. We normalise here
+    // so callers see a stable name. Defensive on both spellings in case
+    // Fathom adds an alias later.
+    const raw = await this.callMutate<{
+      id: string;
+      secret?: string;
+      signing_secret?: string;
+    }>("POST", "/webhooks", body);
+    const signing_secret = raw.signing_secret ?? raw.secret;
+    if (typeof signing_secret !== "string" || signing_secret.length === 0) {
+      throw new FathomApiError(
+        0,
+        `Webhook created (id ${raw.id}) but Fathom response had no secret/signing_secret field. ` +
+          `Keys: ${Object.keys(raw).join(", ")}`
+      );
+    }
+    return { id: raw.id, signing_secret };
   }
 
   async deleteWebhook(id: string): Promise<void> {
@@ -327,6 +340,21 @@ export class FathomApiClient {
       );
     }
 
-    return response.json as T;
+    // 204 No Content (and any other 2xx with empty body) is normal for
+    // DELETE /webhooks/:id. requestUrl's `.json` getter throws on empty
+    // body, so probe via `.text` first.
+    const text = response.text ?? "";
+    if (text.length === 0) {
+      return {} as T;
+    }
+    try {
+      return response.json as T;
+    } catch {
+      // Non-empty but not JSON — treat the same way as empty for mutations,
+      // since the caller only cares about success/failure for DELETE-shaped
+      // requests. POST callers that need a real body will see the cast as
+      // `{}` and explicitly error on missing fields (see createWebhook).
+      return {} as T;
+    }
   }
 }
