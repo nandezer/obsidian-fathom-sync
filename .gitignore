@@ -47,3 +47,7 @@ data.json
 # Backups
 *.bak
 *~
+
+# Local commit-message scratch (used by the build pipeline to avoid
+# PowerShell here-string quoting issues — never meant to be tracked)
+.commit-msg.txt
