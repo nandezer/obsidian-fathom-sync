@@ -14,6 +14,22 @@ Sync your [Fathom](https://fathom.video) meeting summaries and transcripts into 
 - ⏰ **Periodic background sync** at a schedule you set (e.g. every hour)
 - 🔍 **Filter by team or recorder** so only the right meetings land in your vault
 - 🔗 **Bi-directional wikilinks** between each summary and its transcript
+- 🌐 **Webhook intake** *(v2.0)* — also captures meetings shared *with* you, not just ones you recorded. Powered by an optional one-click [Cloudflare Worker](./WEBHOOKS.md).
+
+## Two ways the plugin gets your meetings
+
+The plugin has two intake paths and you can use either or both:
+
+| | Polling (v1, default) | Webhook intake (v2, optional) |
+|---|---|---|
+| **What it sees** | Meetings you recorded + team-shared meetings | Everything above **plus** meetings shared with you by external people |
+| **Latency** | Up to your sync interval (default 30 min) | ~60 seconds end-to-end |
+| **Setup** | Paste API token, done | Deploy a free Cloudflare Worker + paste 2 values |
+| **Rate-limit pressure** | Uses Fathom's 60 req/min budget | Near zero — payloads come inline |
+
+Most users start with polling, then add webhook intake later when they notice meetings shared *to* them aren't showing up. Polling stays as the fallback even when webhooks are configured.
+
+**To enable webhook intake → see [WEBHOOKS.md](./WEBHOOKS.md).** One-click deploy via the button there.
 
 ## Installation (for non-developers)
 
@@ -122,12 +138,32 @@ synced_at: '2020-01-01T13:00:00Z'
 | **Periodic sync** | Auto-sync on a schedule | Off |
 | **Sync interval** | How often periodic sync runs | 30 minutes |
 | **Lookback window** | Days back to check on each periodic sync | 7 |
+| **Webhook intake → Source** *(v2)* | `Disabled` / `Folder` / `HTTP (Cloudflare Worker)` | Disabled |
+| **Inbox folder** *(v2, folder mode)* | Vault path the plugin reads JSON payloads from | `.fathom-inbox` |
+| **Worker URL** *(v2, HTTP mode)* | Your Cloudflare Worker base URL | (none) |
+| **Bearer token** *(v2, HTTP mode)* | Shared secret you set at Worker deploy time | (none, password-masked) |
+
+## Automatic sync of attended meetings (v2)
+
+Fathom's polling API only returns meetings *you* recorded. If a colleague or client recorded a meeting you were on and shared it with you via Fathom, the polling path won't see it. **Webhook intake** closes that gap.
+
+Quick version of the setup:
+
+1. Click the **Deploy to Cloudflare** button in [WEBHOOKS.md](./WEBHOOKS.md). Free Cloudflare account, ~2 minutes, no code.
+2. In Cloudflare, set two secrets: `PLUGIN_BEARER_TOKEN` (random string you generate) and `FATHOM_WEBHOOK_SECRET` (placeholder for now).
+3. In the plugin: **Settings → Webhook intake → Source: HTTP (Cloudflare Worker)**. Paste your Worker URL and bearer token.
+4. Click **Connect**. The plugin tells Fathom to deliver every new meeting to your Worker, copies the signing secret to your clipboard, and shows you the last 6 characters as confirmation. Paste that into Cloudflare as the real `FATHOM_WEBHOOK_SECRET`.
+
+From then on, any meeting that touches your Fathom account — yours, your team's, or anything shared to you by an external person — flows into your vault automatically within about a minute.
+
+Full walkthrough including troubleshooting: [WEBHOOKS.md](./WEBHOOKS.md).
 
 ## Privacy & security
 
 - **Your API token stays local** — it's stored in your Obsidian vault's `.obsidian/plugins/fathom-sync/data.json` and never sent anywhere except Fathom's API.
-- The token is currently in **plaintext** in that file (this is how Obsidian plugin settings work). If your vault is in cloud sync (Dropbox/iCloud/OneDrive), be aware of that. Encrypted storage is planned — see `ROADMAP.md`.
+- The token is currently in **plaintext** in that file (this is how Obsidian plugin settings work). If your vault is in cloud sync (Dropbox/iCloud/OneDrive), be aware of that.
 - The plugin only ever **reads** from Fathom and **writes** to your local vault. It never modifies anything in Fathom.
+- **Webhook intake (v2) runs in your own Cloudflare account.** Meeting payloads pass through *your* Worker and *your* KV namespace. Nothing routes through a service the plugin author operates. The Worker's signing secret and bearer token must be set as Cloudflare Secrets (not plain vars) — the Worker fails closed with HTTP 503 if either is missing.
 
 ## Troubleshooting
 
