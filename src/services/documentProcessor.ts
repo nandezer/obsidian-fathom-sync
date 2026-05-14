@@ -45,22 +45,24 @@ export class DocumentProcessor {
 
     const recorderName = meeting.recorded_by?.name ?? "Unknown";
     const recorderEmail = meeting.recorded_by?.email ?? "";
-    const attendees = (meeting.calendar_invitees ?? []).map((a) => a.name);
+    const attendees = (meeting.calendar_invitees ?? [])
+      .map((a) => a?.name)
+      .filter((n): n is string => typeof n === "string" && n.length > 0);
 
     const frontmatter = [
       "---",
       `fathom_id: ${meeting.recording_id}`,
-      `fathom_url: "${meeting.url}"`,
-      `title: "${escapeFrontmatterString(meeting.title)}"`,
-      `recorded_by: "${escapeFrontmatterString(recorderName)}"`,
-      `recorded_by_email: "${escapeFrontmatterString(recorderEmail)}"`,
+      `fathom_url: ${yamlString(meeting.url)}`,
+      `title: ${yamlString(meeting.title)}`,
+      `recorded_by: ${yamlString(recorderName)}`,
+      `recorded_by_email: ${yamlString(recorderEmail)}`,
       `attendees:`,
-      ...attendees.map((a) => `  - "${escapeFrontmatterString(a)}"`),
-      `created_at: "${meeting.created_at}"`,
-      `synced_at: "${nowIso()}"`,
+      ...attendees.map((a) => `  - ${yamlString(a)}`),
+      `created_at: ${yamlString(meeting.created_at)}`,
+      `synced_at: ${yamlString(nowIso())}`,
       `synced_by: fathom-sync`,
       `type: summary`,
-      transcriptPath ? `transcript: "[[${transcriptPath}]]"` : null,
+      transcriptPath ? `transcript: ${yamlString(`[[${transcriptPath}]]`)}` : null,
       "---",
     ]
       .filter((line) => line !== null)
@@ -92,21 +94,23 @@ export class DocumentProcessor {
     const frontmatter = [
       "---",
       `fathom_id: ${meeting.recording_id}`,
-      `fathom_url: "${meeting.url}"`,
-      `title: "${escapeFrontmatterString(meeting.title)}"`,
+      `fathom_url: ${yamlString(meeting.url)}`,
+      `title: ${yamlString(meeting.title)}`,
       `type: transcript`,
       `synced_by: fathom-sync`,
-      `note: "[[${summaryPath}]]"`,
-      `synced_at: "${nowIso()}"`,
+      `note: ${yamlString(`[[${summaryPath}]]`)}`,
+      `synced_at: ${yamlString(nowIso())}`,
       "---",
     ].join("\n");
 
     const safeSegments = Array.isArray(segments) ? segments : [];
     const lines = safeSegments.map((seg) => {
-      const secs = hhmmssToSeconds(seg.timestamp);
+      const ts = typeof seg.timestamp === "string" ? seg.timestamp : "00:00:00";
+      const secs = hhmmssToSeconds(ts);
       const link = `${meeting.url}?timestamp=${secs}`;
       const speakerName = speakerToString(seg.speaker);
-      return `[${seg.timestamp}](${link}) **${speakerName}:** ${seg.text}`;
+      const text = typeof seg.text === "string" ? seg.text : "";
+      return `[${ts}](${link}) **${speakerName}:** ${text}`;
     });
 
     const body = [
@@ -121,8 +125,15 @@ export class DocumentProcessor {
   }
 }
 
-function escapeFrontmatterString(value: string): string {
-  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+/**
+ * Quote a value as a YAML single-quoted scalar. Single-quoted scalars in YAML
+ * 1.2 only need `'` doubled — no other escaping. This avoids the brittle
+ * backslash-escaping that double-quoted YAML demands and that the previous
+ * implementation got partially wrong.
+ */
+function yamlString(value: string): string {
+  const safe = value.replace(/'/g, "''");
+  return `'${safe}'`;
 }
 
 function speakerToString(speaker: unknown): string {

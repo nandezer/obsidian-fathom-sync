@@ -59,18 +59,18 @@ Notes will land in `Fathom/Summaries/` and `Fathom/Transcripts/` (or whichever f
 ```markdown
 ---
 fathom_id: 000000000
-fathom_url: "https://fathom.video/calls/EXAMPLE"
-title: "Example meeting"
-recorded_by: "Plugin Author"
-recorded_by_email: "author@example.com"
+fathom_url: 'https://fathom.video/calls/EXAMPLE'
+title: 'Example meeting'
+recorded_by: 'Plugin Author'
+recorded_by_email: 'author@example.com'
 attendees:
-  - "User Two"
-  - "User Three"
-created_at: "2026-05-13T08:05:48Z"
-synced_at: "2026-05-13T10:00:00Z"
+  - 'User Two'
+  - 'User Three'
+created_at: '2026-05-13T08:05:48Z'
+synced_at: '2026-05-13T10:00:00Z'
 synced_by: fathom-sync
 type: summary
-transcript: "[[Fathom/Transcripts/2026-05-13 Example meeting (000000000)]]"
+transcript: '[[Fathom/Transcripts/2026-05-13 Example meeting (000000000)]]'
 ---
 
 # Example meeting
@@ -90,9 +90,12 @@ User Two outlines three main discussion points...
 ```markdown
 ---
 fathom_id: 000000000
+fathom_url: 'https://fathom.video/calls/EXAMPLE'
+title: 'Example meeting'
 type: transcript
 synced_by: fathom-sync
-note: "[[Fathom/Summaries/2026-05-13 Example meeting (000000000)]]"
+note: '[[Fathom/Summaries/2026-05-13 Example meeting (000000000)]]'
+synced_at: '2026-05-13T10:00:00Z'
 ---
 
 # Example meeting — Transcript
@@ -106,6 +109,7 @@ note: "[[Fathom/Summaries/2026-05-13 Example meeting (000000000)]]"
 | Setting | What it does | Default |
 |---------|-------------|---------|
 | **API token** | Your Fathom API key | (none, required) |
+| **Test** | Probe `/teams` to verify the token works | — |
 | **Sync teams** | Comma-separated team names to filter by | (all teams) |
 | **Recorded by (emails)** | Comma-separated emails to filter by recorder | (all recorders) |
 | **Sync summaries** | Download AI summaries | On |
@@ -125,13 +129,21 @@ note: "[[Fathom/Summaries/2026-05-13 Example meeting (000000000)]]"
 
 ## Troubleshooting
 
-**"Fathom API 401" error:** Your API token is invalid or expired. Generate a new one at [fathom.video/customize](https://fathom.video/customize#api-access-header).
+**First step for any auth/permission issue:** in **Settings → Fathom Sync**, click the **Test** button next to the API token field. It hits Fathom's `/teams` endpoint and tells you immediately whether the token is valid, expired, or lacks permission.
 
-**"Fathom API 403" error:** The token is valid but doesn't have access to the team you filtered by. Check the team names match exactly (case-sensitive).
+**"Invalid API token" / 401:** Your API token is wrong, expired, or revoked. Generate a new one at [fathom.video/customize](https://fathom.video/customize#api-access-header).
 
-**Nothing happens after clicking sync:** Open the dev console with `Ctrl+Shift+I`, click the "Console" tab, and look for `[Fathom Sync]` log lines. The most common cause is no meetings in the lookback window — try running **"Full sync"** from settings to fetch everything.
+**"Token lacks permission" / 403:** The token is valid but doesn't have access to the team you filtered by. Check the team names match exactly (case-sensitive).
 
-**"File already exists" warnings:** Harmless — means the plugin found a previously synced note and is keeping it. Re-run sync; it'll skip those properly next time.
+**"A sync is already running" notice:** A previous sync is still in flight (likely the periodic one). Wait for it to finish — the manual click will be ignored.
+
+**"N existing notes with fathom_id from another plugin were ignored":** You have notes from another plugin (typically obsidian-granola-sync) that also use the `fathom_id` field. Fathom Sync won't touch them, but it WILL create its own copies because they lack the `synced_by: fathom-sync` marker. To avoid duplicates, either move the existing notes out of the vault first or accept the doubling for already-imported meetings.
+
+**Nothing happens after clicking sync:** The most common cause is no meetings in the lookback window — try **"Full sync"** from settings. If that's also silent, open the dev console with `Ctrl+Shift+I` and look for `[Fathom Sync]` log lines.
+
+**"File already exists" warnings:** Harmless — the plugin found a previously synced note and is keeping it. Re-run sync; it'll skip those properly next time.
+
+**Incremental sync stuck repeating the same meetings:** Click **Reset sync cursor** in settings to clear the saved pagination state, then run a standard sync again.
 
 ## Releases
 

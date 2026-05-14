@@ -1,6 +1,6 @@
 {
   "name": "obsidian-fathom-sync",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Sync Fathom meeting summaries and transcripts to Obsidian",
   "main": "main.js",
   "scripts": {

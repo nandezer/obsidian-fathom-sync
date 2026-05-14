@@ -88,3 +88,31 @@ export interface NoteMetadata {
 
 /** Composite cache key: `{recording_id}-{type}` */
 export type CacheKey = string;
+
+// Webhook intake (v2.0)
+
+/**
+ * Payload shape for Fathom's `new-meeting-content-ready` webhook event.
+ *
+ * The webhook carries the full meeting record plus any of summary, transcript,
+ * action_items, crm_matches that were requested when the webhook was created.
+ * We mirror FathomMeeting's shape so the same DocumentProcessor can write notes
+ * from either source.
+ *
+ * `delivery_id` is set by the queue layer (HttpQueue, FolderQueue) from the
+ * webhook-id header / filename so we can dedup at ingest time.
+ */
+export interface WebhookPayload {
+  /** Stable per-delivery ID assigned by Fathom (from webhook-id header). */
+  delivery_id: string;
+  /** Server timestamp from the webhook-timestamp header (seconds since epoch). */
+  delivered_at: number;
+  /** Which Fathom trigger fired this delivery. */
+  triggered_for:
+    | "my_recordings"
+    | "shared_external_recordings"
+    | "my_shared_with_team_recordings"
+    | "shared_team_recordings";
+  /** The meeting record — same shape as the REST API's /meetings response item. */
+  meeting: FathomMeeting;
+}

@@ -30,31 +30,39 @@ export class FathomApiClient {
   }
 
   /**
-   * Token-bucket-ish throttle: Fathom rate-limits at 60 req/min, so we
-   * keep ~1.1s between calls. With this we can run unlimited meetings
-   * without ever hitting 429 in the steady state.
+   * Token-bucket-ish throttle: Fathom rate-limits at 60 req/min, so we keep
+   * ~1.1s between calls. Static so the gate survives when the client is
+   * rebuilt mid-sync (e.g. when settings are saved during an active run).
    */
-  private nextSlot = 0;
-  private readonly minInterval = 1100; // ms
+  private static nextSlot = 0;
+  private static readonly minInterval = 1100; // ms
 
   private async throttle(): Promise<void> {
     const now = Date.now();
-    if (now < this.nextSlot) {
-      await new Promise((r) => setTimeout(r, this.nextSlot - now));
+    if (now < FathomApiClient.nextSlot) {
+      await new Promise((r) => setTimeout(r, FathomApiClient.nextSlot - now));
     }
-    this.nextSlot = Math.max(now, this.nextSlot) + this.minInterval;
+    FathomApiClient.nextSlot =
+      Math.max(now, FathomApiClient.nextSlot) + FathomApiClient.minInterval;
   }
 
   /**
    * Wrapper around Obsidian's requestUrl() that bypasses Electron CORS.
    * We use throw: false so non-2xx responses don't blow up before we can
-   * read the body for diagnostics. Retries once on 429 after a backoff.
+   * read the body for diagnostics.
+   *
+   * Retries on:
+   *  - 429 (rate limit): honours Retry-After header, else 30s.
+   *  - 502 / 503 / 504 (transient server errors): exponential backoff
+   *    starting at 2s. Fathom's edge regularly returns brief 502s under load;
+   *    these usually clear within a few seconds.
    */
   private async call<T>(
     path: string,
     query?: URLSearchParams,
-    retriesOn429 = 2
+    attempt = 0
   ): Promise<T> {
+    const maxAttempts = 4; // initial + 3 retries
     await this.throttle();
 
     const url = query
@@ -69,22 +77,36 @@ export class FathomApiClient {
     };
 
     const response = await requestUrl(params);
+    const status = response.status;
+    const isLastAttempt = attempt >= maxAttempts - 1;
 
-    if (response.status === 429 && retriesOn429 > 0) {
-      // Honour Retry-After header if present, otherwise back off 30s
+    if (status === 429 && !isLastAttempt) {
       const retryAfterHeader = response.headers?.["retry-after"];
       const retryAfter = retryAfterHeader ? Number(retryAfterHeader) : 30;
       const waitMs = Math.max(1000, retryAfter * 1000);
-      console.warn(`[Fathom Sync] Rate-limited; backing off ${waitMs}ms`);
+      console.warn(
+        `[Fathom Sync] Rate-limited on ${path}; backing off ${waitMs}ms (attempt ${attempt + 1}/${maxAttempts})`
+      );
       await new Promise((r) => setTimeout(r, waitMs));
-      return this.call<T>(path, query, retriesOn429 - 1);
+      return this.call<T>(path, query, attempt + 1);
     }
 
-    if (response.status < 200 || response.status >= 300) {
+    if ((status === 502 || status === 503 || status === 504) && !isLastAttempt) {
+      // 2s, 4s, 8s — Fathom asks for "try again in 30 seconds" on 502, but in
+      // practice their edge clears within a few seconds. Start small.
+      const waitMs = 2000 * Math.pow(2, attempt);
+      console.warn(
+        `[Fathom Sync] Transient ${status} on ${path}; retrying in ${waitMs}ms (attempt ${attempt + 1}/${maxAttempts})`
+      );
+      await new Promise((r) => setTimeout(r, waitMs));
+      return this.call<T>(path, query, attempt + 1);
+    }
+
+    if (status < 200 || status >= 300) {
       const body = (response.text ?? "").slice(0, 500);
       throw new FathomApiError(
-        response.status,
-        `Fathom API ${response.status}: ${body || "no response body"}`
+        status,
+        `Fathom API ${status}: ${body || "no response body"}`
       );
     }
 
@@ -109,7 +131,7 @@ export class FathomApiClient {
       for (const t of opts.teams) q.append("teams[]", t);
     }
     if (opts.recordedBy?.length) {
-      for (const e of opts.recordedBy) q.append("recorded_by[]", e);
+      for (const e of opts.recordedBy) q.append("recorded_by[]", e.toLowerCase());
     }
     if (opts.createdAfter) q.set("created_after", opts.createdAfter);
     if (opts.createdBefore) q.set("created_before", opts.createdBefore);
@@ -177,8 +199,11 @@ export class FathomApiClient {
       }
     }
 
-    console.warn(`[Fathom Sync] Empty/unknown summary shape for recording ${recordingId}`);
-    return { template_name: "default", markdown_formatted: "" };
+    throw new FathomApiError(
+      0,
+      `Empty or unknown summary shape for recording ${recordingId}. ` +
+        `Sample: ${JSON.stringify(raw).slice(0, 300)}`
+    );
   }
 
   async getTranscript(recordingId: number): Promise<FathomTranscriptSegment[]> {
@@ -202,5 +227,106 @@ export class FathomApiClient {
 
   async listTeams(): Promise<FathomTeam[]> {
     return this.call<FathomTeam[]>("/teams");
+  }
+
+  /**
+   * Register a webhook with Fathom.
+   *
+   * Returns the created webhook's id and the signing secret (sent by Fathom
+   * exactly ONCE in the create response — we surface it so the user can
+   * paste it into their Worker's secret store).
+   *
+   * `triggered_for` defaults to all four categories so a single webhook
+   * covers own + team + shared meetings. The whole point of the v2 path is
+   * that `shared_external_recordings` only flows through here.
+   */
+  async createWebhook(opts: {
+    destinationUrl: string;
+    triggeredFor?: ReadonlyArray<
+      | "my_recordings"
+      | "shared_external_recordings"
+      | "my_shared_with_team_recordings"
+      | "shared_team_recordings"
+    >;
+    includeSummary?: boolean;
+    includeTranscript?: boolean;
+    includeActionItems?: boolean;
+    includeCrmMatches?: boolean;
+  }): Promise<{ id: string; signing_secret: string }> {
+    const body = {
+      destination_url: opts.destinationUrl,
+      triggered_for: opts.triggeredFor ?? [
+        "my_recordings",
+        "shared_external_recordings",
+        "my_shared_with_team_recordings",
+        "shared_team_recordings",
+      ],
+      include_summary: opts.includeSummary ?? true,
+      include_transcript: opts.includeTranscript ?? true,
+      include_action_items: opts.includeActionItems ?? true,
+      include_crm_matches: opts.includeCrmMatches ?? false,
+    };
+    return this.callMutate<{ id: string; signing_secret: string }>(
+      "POST",
+      "/webhooks",
+      body
+    );
+  }
+
+  async deleteWebhook(id: string): Promise<void> {
+    await this.callMutate("DELETE", `/webhooks/${id}`);
+  }
+
+  /**
+   * Variant of {@link call} for non-GET requests. Same throttle + retry
+   * envelope, plus a JSON body. Webhook registration is rare so we don't
+   * try to share code more aggressively.
+   */
+  private async callMutate<T>(
+    method: "POST" | "DELETE",
+    path: string,
+    body?: unknown,
+    attempt = 0
+  ): Promise<T> {
+    const maxAttempts = 4;
+    await this.throttle();
+
+    const params: RequestUrlParam = {
+      url: `${BASE_URL}${path}`,
+      method,
+      headers: this.headers,
+      throw: false,
+    };
+    if (body !== undefined) {
+      params.body = JSON.stringify(body);
+    }
+
+    const response = await requestUrl(params);
+    const status = response.status;
+    const isLastAttempt = attempt >= maxAttempts - 1;
+
+    if (status === 429 && !isLastAttempt) {
+      const retryAfterHeader = response.headers?.["retry-after"];
+      const retryAfter = retryAfterHeader ? Number(retryAfterHeader) : 30;
+      const waitMs = Math.max(1000, retryAfter * 1000);
+      await new Promise((r) => setTimeout(r, waitMs));
+      return this.callMutate<T>(method, path, body, attempt + 1);
+    }
+
+    if ((status === 502 || status === 503 || status === 504) && !isLastAttempt) {
+      const waitMs = 2000 * Math.pow(2, attempt);
+      await new Promise((r) => setTimeout(r, waitMs));
+      return this.callMutate<T>(method, path, body, attempt + 1);
+    }
+
+    if (status < 200 || status >= 300) {
+      const bodyText = (response.text ?? "").slice(0, 500);
+      throw new FathomApiError(
+        status,
+        `Fathom API ${method} ${path} → ${status}: ${bodyText || "no response body"}`
+      );
+    }
+
+    return response.json as T;
   }
 }

@@ -17,7 +17,7 @@ src/
 ├── types.ts                       # Fathom REST API types (verified against live API)
 ├── services/
 │   ├── fathomApi.ts               # REST client. Uses Obsidian's requestUrl() (not fetch — fetch is CORS-blocked).
-│   │                              # Includes 1.1s throttle and 429 retry.
+│   │                              # Static 1.1s throttle, 429 + 502/503/504 retry, throws on unknown summary shapes.
 │   ├── documentProcessor.ts       # Builds Markdown notes (summary + transcript) from API responses
 │   ├── fileSyncService.ts         # Vault cache + dedup. Keyed on {recording_id}-{type}.
 │   │                              # Only counts notes with `synced_by: fathom-sync` frontmatter.
@@ -78,6 +78,38 @@ Notes written by this plugin always include `synced_by: fathom-sync` in frontmat
 
 Obsidian stores `data.json` in plain text in the vault. The user's API token is therefore on disk unencrypted. See `ROADMAP.md` → "Encrypted token storage" for the planned fix using Electron's `safeStorage`.
 
+### Sync mutex lives in main.ts, not SyncService
+
+`FathomSyncPlugin.inFlightSync` is the single-flight gate. Ribbon click, command palette, and the periodic `setInterval` tick all funnel through `triggerSync()`, which awaits any existing in-flight promise instead of starting a second sync. **Don't add a second entry point that calls `SyncService.performSync` directly** — it would bypass the mutex.
+
+### Periodic vs manual: trigger matters for toasts
+
+`triggerSync(mode, trigger)` carries a `"manual" | "periodic"` discriminator. Periodic failures intentionally do NOT raise a `Notice` (overnight offline used to stack 16+ toasts). Status bar going red is the only periodic-failure signal. If you add a new sync entry point, plumb the trigger through.
+
+### Foreign `fathom_id` notes are counted, not absorbed
+
+`FileSyncService.foreignFathomNotes` counts notes that have `fathom_id` frontmatter but lack `synced_by: fathom-sync` (typically obsidian-granola-sync output). `main.ts` surfaces a one-time Notice when non-zero so users understand why duplicates appear. **Don't loosen the `synced_by` filter** to absorb foreign notes — it would mean we'd silently update notes written by other plugins.
+
+### Throttle is static on FathomApiClient
+
+`FathomApiClient.nextSlot` and `minInterval` are `static`. The plugin rebuilds the API client whenever the API token changes; previously this reset the throttle and the first request after a save would race past the 1.1s gate. Don't make these instance fields again.
+
+### Empty summaries throw, they don't return `""`
+
+`FathomApiClient.getSummary` throws `FathomApiError` when no recognised shape is found. The old code returned `{ markdown_formatted: "" }`, which then wrote a `synced_by: fathom-sync` stub note that poisoned the dedup cache forever. If you ever need a "skip this meeting" path, do it in `SyncService.processMeeting` — never write the stub.
+
+### YAML frontmatter uses single-quoted scalars
+
+`yamlString()` in `documentProcessor.ts` wraps every value in `'...'` and doubles any internal `'`. This is the YAML 1.2 single-quoted scalar rule — one escape, no backslash games. Double-quoted YAML requires escaping `\` and `"` differently from JSON; the old code got that subtly wrong for titles containing `\`. **Don't switch back to double quotes** without using a real YAML library.
+
+### Cursor is only saved on clean completion
+
+`SyncService.performSync` saves `lastSyncCursor` as `""` when pagination reaches the end cleanly, and to the next-page cursor only when interrupted by a non-401 error. The "Reset sync cursor" button in settings exists for when the saved cursor goes stale (e.g. the user toggles a team filter and wants a fresh scan).
+
+### `saveSettings` only rebuilds services on token change
+
+`FathomSyncPlugin.saveSettings` compares the new token against `lastBuiltApiToken` and only calls `initServices()` when it changes. Per-keystroke saves in unrelated fields (folders, filters, filename pattern) used to tear down the in-flight `FathomApiClient` and throttle. Keep this guard.
+
 ## Style
 
 - TypeScript strict-ish (`strictNullChecks`, `noImplicitAny`)
@@ -91,3 +123,6 @@ Obsidian stores `data.json` in plain text in the vault. The user's API token is 
 - Don't store user-facing strings inline in API client — keep `Notice()` calls in `main.ts` / `syncService.ts`
 - Don't loosen the `synced_by` filter in `fileSyncService.ts` — it's load-bearing for dedup with other plugins
 - Don't remove the throttle in `fathomApi.ts` without replacing it — Fathom will 429 fast otherwise
+- Don't bypass `FathomSyncPlugin.triggerSync()` to start a sync — it owns the single-flight mutex
+- Don't return placeholder data from `FathomApiClient.getSummary` / `getTranscript` — throw instead, so the cache isn't poisoned with stub notes
+- Don't write frontmatter as double-quoted YAML without a real YAML library — use `yamlString()` (single-quoted) or extend it

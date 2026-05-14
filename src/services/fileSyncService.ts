@@ -19,6 +19,14 @@ export class FileSyncService {
   }
 
   /**
+   * Count of vault notes that have `fathom_id` frontmatter but were NOT
+   * written by this plugin (e.g. notes from obsidian-granola-sync). These
+   * won't appear in the dedup cache, so a sync against the same meetings
+   * will write a second copy. UI surfaces this on first sync.
+   */
+  foreignFathomNotes = 0;
+
+  /**
    * Scan all markdown files in the vault and build the in-memory cache.
    * Only counts notes that were created BY THIS PLUGIN — identified by the
    * `synced_by: fathom-sync` frontmatter marker. This avoids colliding with
@@ -26,20 +34,30 @@ export class FileSyncService {
    */
   async buildCache(): Promise<void> {
     this.cache.clear();
+    this.foreignFathomNotes = 0;
 
     const files = this.app.vault.getMarkdownFiles();
     for (const file of files) {
       const cache = this.app.metadataCache.getFileCache(file);
       const fm = cache?.frontmatter;
-      if (!fm?.fathom_id || !fm?.type) continue;
-      if (fm.synced_by !== "fathom-sync") continue;
+      if (!fm?.fathom_id) continue;
+
+      if (fm.synced_by !== "fathom-sync") {
+        this.foreignFathomNotes++;
+        continue;
+      }
       if (fm.type !== "summary" && fm.type !== "transcript") continue;
 
       const key = this.cacheKey(Number(fm.fathom_id), fm.type as NoteType);
       this.cache.set(key, file);
     }
 
-    logger.info(`Cache built: ${this.cache.size} Fathom Sync notes found.`);
+    logger.info(
+      `Cache built: ${this.cache.size} Fathom Sync notes found` +
+        (this.foreignFathomNotes
+          ? ` (+ ${this.foreignFathomNotes} foreign fathom_id notes ignored).`
+          : ".")
+    );
   }
 
   has(recordingId: number, type: NoteType): boolean {

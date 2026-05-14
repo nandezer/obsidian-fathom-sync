@@ -25,3 +25,25 @@ Thumbs.db
 
 # Release zips kept under releases/ are fine; ignore ad-hoc zips at root
 /fathom-sync-*.zip
+
+# Cloudflare Worker (v2) local state
+worker/node_modules/
+worker/.wrangler/
+worker/.miniflare/
+worker/.dev.vars
+worker/.dev.vars.*
+
+# Env / secrets (defence in depth)
+.env
+.env.*
+*.env
+.dev.vars
+
+# Obsidian plugin runtime state. data.json is generated per-install and
+# can contain the user's Fathom API token and any registered webhook ID.
+# It must never be committed.
+data.json
+
+# Backups
+*.bak
+*~
