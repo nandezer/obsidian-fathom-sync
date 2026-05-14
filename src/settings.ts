@@ -222,17 +222,32 @@ export class FathomSyncSettingTab extends PluginSettingTab {
           .addOption("http", "HTTP (Cloudflare Worker)")
           .setValue(this.plugin.settings.webhookQueueType)
           .onChange(async (value) => {
-            this.plugin.settings.webhookQueueType = value as
-              | "none"
-              | "folder"
-              | "http";
+            const newType = value as "none" | "folder" | "http";
+            this.plugin.settings.webhookQueueType = newType;
             await this.plugin.saveSettings();
-            this.display(); // re-render to show/hide relevant fields
+            // Toggle visibility of pre-rendered blocks. Avoids the race
+            // where this.display() doesn't actually re-run before the user
+            // looks for the new fields (Obsidian's settings panel re-render
+            // can be skipped if the user is mid-interaction with a focused
+            // input).
+            folderBlock.style.display = newType === "folder" ? "" : "none";
+            httpBlock.style.display = newType === "http" ? "" : "none";
           })
       );
 
-    if (this.plugin.settings.webhookQueueType === "folder") {
-      new Setting(containerEl)
+    // Pre-create both blocks; visibility is driven by the dropdown above.
+    // We rendered them lazily before, which meant switching Source from
+    // Folder to HTTP didn't show the HTTP fields until the user manually
+    // toggled the plugin off/on. Render-always-toggle-CSS sidesteps that.
+    const folderBlock = containerEl.createDiv();
+    folderBlock.style.display =
+      this.plugin.settings.webhookQueueType === "folder" ? "" : "none";
+    const httpBlock = containerEl.createDiv();
+    httpBlock.style.display =
+      this.plugin.settings.webhookQueueType === "http" ? "" : "none";
+
+    {
+      new Setting(folderBlock)
         .setName("Inbox folder")
         .setDesc(
           "Vault folder where webhook payloads are dropped as .json files. The plugin reads, " +
@@ -249,7 +264,7 @@ export class FathomSyncSettingTab extends PluginSettingTab {
             })
         );
 
-      new Setting(containerEl)
+      new Setting(folderBlock)
         .setName("Test queue")
         .setDesc("Verify the folder exists and is readable.")
         .addButton((btn) =>
@@ -282,8 +297,8 @@ export class FathomSyncSettingTab extends PluginSettingTab {
         );
     }
 
-    if (this.plugin.settings.webhookQueueType === "http") {
-      containerEl.createEl("p", {
+    {
+      httpBlock.createEl("p", {
         text:
           "Deploy the Worker once via the 'Deploy to Cloudflare' button in the plugin README, " +
           "then paste its URL and the bearer token you set at deploy time below. " +
@@ -292,7 +307,7 @@ export class FathomSyncSettingTab extends PluginSettingTab {
         cls: "setting-item-description",
       });
 
-      new Setting(containerEl)
+      new Setting(httpBlock)
         .setName("Worker URL")
         .setDesc("Base URL of your Cloudflare Worker (no trailing slash).")
         .addText((text) =>
@@ -305,7 +320,7 @@ export class FathomSyncSettingTab extends PluginSettingTab {
             })
         );
 
-      new Setting(containerEl)
+      new Setting(httpBlock)
         .setName("Bearer token")
         .setDesc("Shared secret you set when deploying the Worker.")
         .addText((text) => {
@@ -323,7 +338,7 @@ export class FathomSyncSettingTab extends PluginSettingTab {
             });
         });
 
-      new Setting(containerEl)
+      new Setting(httpBlock)
         .setName("Test queue")
         .setDesc("Hit the Worker's /health and /pending endpoints.")
         .addButton((btn) =>
@@ -355,7 +370,7 @@ export class FathomSyncSettingTab extends PluginSettingTab {
           })
         );
 
-      new Setting(containerEl)
+      new Setting(httpBlock)
         .setName(
           this.plugin.settings.registeredWebhookId
             ? "Re-register webhook"
@@ -375,6 +390,33 @@ export class FathomSyncSettingTab extends PluginSettingTab {
             )
             .setCta()
             .onClick(() => this.handleConnectWebhook(btn))
+        );
+
+      // Escape hatch: delete a specific Fathom webhook by id. Useful when an
+      // older plugin version crashed mid-Connect and left orphans on the
+      // server-side. Fathom doesn't expose GET /webhooks so we can't list
+      // them automatically — the user pastes the id from a log line or
+      // a Fathom support reply.
+      let purgeInput = "";
+      new Setting(httpBlock)
+        .setName("Purge orphan webhook")
+        .setDesc(
+          "If an earlier failed Connect left a stale webhook on Fathom's side, " +
+            "paste its id here to delete it. The plugin's saved id (if any) is " +
+            "deleted by Re-register automatically — this field is only for cleanup."
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder("e.g. WgLFyxyMpbQuUYF2")
+            .onChange((value) => {
+              purgeInput = value;
+            })
+        )
+        .addButton((btn) =>
+          btn
+            .setButtonText("Delete")
+            .setWarning()
+            .onClick(() => this.handlePurgeWebhook(btn, purgeInput))
         );
     }
 
@@ -557,13 +599,45 @@ export class FathomSyncSettingTab extends PluginSettingTab {
     }
 
     btn.setDisabled(true).setButtonText("Working…");
+    let createdId: string | null = null;
     try {
       const created = await this.registerWebhook();
+      createdId = created.id;
+
+      // Persist the new id BEFORE anything else that could throw. If
+      // saveSettings or surfaceSigningSecret then fails, we roll back by
+      // deleting the webhook so we don't leak orphans on Fathom's side
+      // (which can't be listed via API and accumulate forever).
       this.plugin.settings.registeredWebhookId = created.id;
       await this.plugin.saveSettings();
+
+      // Past this point a thrown error means we already persisted the id,
+      // so rollback is only correct for failures BEFORE this line.
+      createdId = null;
+
       this.display();
       await this.surfaceSigningSecret(created.id, created.signing_secret);
     } catch (err) {
+      if (createdId) {
+        // Best-effort rollback. If this also fails we're stuck with a
+        // server-side orphan, but the user at least won't end up with the
+        // local state pointing at a webhook they can't see.
+        logger.warn(
+          `Rolling back orphan webhook ${createdId} after failure mid-flow`
+        );
+        try {
+          await this.plugin.getSyncService().api.deleteWebhook(createdId);
+        } catch (rollbackErr) {
+          logger.error(
+            `Rollback delete failed for ${createdId} — orphan webhook left on Fathom. ` +
+              "Use 'Purge orphan webhook' in settings.",
+            rollbackErr
+          );
+        }
+        this.plugin.settings.registeredWebhookId = "";
+        await this.plugin.saveSettings();
+      }
+
       const status = err instanceof FathomApiError ? err.status : undefined;
       const message =
         status === 401
@@ -581,6 +655,42 @@ export class FathomSyncSettingTab extends PluginSettingTab {
         .setButtonText(
           this.plugin.settings.registeredWebhookId ? "Re-register" : "Connect"
         );
+    }
+  }
+
+  /**
+   * Manual escape hatch for deleting a webhook by its Fathom ID. Used when
+   * Connect crashed mid-flow on an earlier plugin version and left orphans
+   * on the Fathom side. Fathom does not expose GET /webhooks, so the user
+   * has to find the id from logs (the failure message shows it) or from
+   * Fathom support. Cheap to add and easy to remove if Fathom ever
+   * publishes a list endpoint.
+   */
+  private async handlePurgeWebhook(
+    btn: ButtonComponent,
+    webhookId: string
+  ): Promise<void> {
+    const trimmed = webhookId.trim();
+    if (!trimmed) {
+      new Notice("Fathom Sync: paste a webhook id first.");
+      return;
+    }
+    btn.setDisabled(true).setButtonText("Deleting…");
+    try {
+      await this.plugin.getSyncService().api.deleteWebhook(trimmed);
+      new Notice(`Fathom Sync: webhook ${trimmed.slice(0, 8)}… deleted.`);
+    } catch (err) {
+      const status = err instanceof FathomApiError ? err.status : undefined;
+      const message =
+        status === 404
+          ? "not found (already deleted?)"
+          : err instanceof Error
+          ? err.message
+          : "unknown error";
+      new Notice(`Fathom Sync: delete failed — ${message}`);
+      logger.error(`Purge failed for ${trimmed}`, err);
+    } finally {
+      btn.setDisabled(false).setButtonText("Delete");
     }
   }
 

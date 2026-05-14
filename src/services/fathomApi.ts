@@ -226,7 +226,18 @@ export class FathomApiClient {
   }
 
   async listTeams(): Promise<FathomTeam[]> {
-    return this.call<FathomTeam[]>("/teams");
+    // Fathom returns `{ items, limit, next_cursor }` for /teams, not a bare
+    // array. The v1 settings.testConnection() defensively wraps with
+    // `Array.isArray(teams) ? teams.length : 0` so the bug was invisible
+    // (just reported "0 teams visible" for everyone), but anything that
+    // actually iterated the array would have silently looped zero times.
+    const raw = await this.call<unknown>("/teams");
+    if (Array.isArray(raw)) return raw as FathomTeam[];
+    if (raw && typeof raw === "object") {
+      const items = (raw as { items?: unknown }).items;
+      if (Array.isArray(items)) return items as FathomTeam[];
+    }
+    return [];
   }
 
   /**
