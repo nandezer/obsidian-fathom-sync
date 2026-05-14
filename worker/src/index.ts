@@ -44,12 +44,40 @@ interface WebhookPayload {
 const DELIVERY_KEY_PREFIX = "delivery:";
 const DELIVERY_TTL_SECONDS = 7 * 24 * 60 * 60;
 
+/**
+ * Reject webhook deliveries whose timestamp is more than this many seconds
+ * away from the Worker's current time. Limits replay-attack window. Five
+ * minutes matches the Svix-recommended default.
+ */
+const MAX_TIMESTAMP_SKEW_SECONDS = 300;
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    // Fail closed if either secret is missing. Cloudflare leaves unset env
+    // bindings as undefined, and an undefined PLUGIN_BEARER_TOKEN would
+    // make every "Authorization: Bearer undefined" request authenticate;
+    // an undefined FATHOM_WEBHOOK_SECRET would let any signature verify.
+    // /health is exempt so deployment readiness probes still work.
+    const isHealthcheck =
+      request.method === "GET" && url.pathname === "/health";
+    if (!isHealthcheck) {
+      if (!env.PLUGIN_BEARER_TOKEN || !env.FATHOM_WEBHOOK_SECRET) {
+        return json(
+          {
+            error: "worker_not_configured",
+            message:
+              "Set PLUGIN_BEARER_TOKEN and FATHOM_WEBHOOK_SECRET via " +
+              "`wrangler secret put` before sending traffic.",
+          },
+          503
+        );
+      }
+    }
+
     try {
-      if (request.method === "GET" && url.pathname === "/health") {
+      if (isHealthcheck) {
         return json({ ok: true });
       }
       if (request.method === "POST" && url.pathname === "/webhook") {
@@ -63,9 +91,12 @@ export default {
       }
       return json({ error: "not_found" }, 404);
     } catch (err) {
+      // Log the full error for the operator (Cloudflare dashboard) but
+      // return a generic message to the caller. Echoing err.message could
+      // disclose KV internals or stack-trace hints to unauthenticated
+      // callers on /webhook.
       console.error("Unhandled error:", err);
-      const message = err instanceof Error ? err.message : "unknown";
-      return json({ error: "internal_error", message }, 500);
+      return json({ error: "internal_error" }, 500);
     }
   },
 } satisfies ExportedHandler<Env>;
@@ -88,6 +119,31 @@ async function verifyFathomSignature(
   rawBody: string,
   secret: string
 ): Promise<{ ok: true; webhookId: string } | { ok: false; reason: string }> {
+  const headers = readSignatureHeaders(request);
+  if (!headers.ok) return headers;
+
+  const { id, timestamp, signatures } = headers;
+  const expectedSig = await computeExpectedSignature(
+    secret,
+    id,
+    timestamp,
+    rawBody
+  );
+  const match = signatures.some((sig) => constantTimeEqual(sig, expectedSig));
+  if (!match) return { ok: false, reason: "signature mismatch" };
+  return { ok: true, webhookId: id };
+}
+
+/**
+ * Pull and validate the three Svix signature headers. Also enforces the
+ * 5-minute replay window so callers don't have to. The list of presented
+ * signatures is returned pre-stripped of the `v1,` algorithm prefix.
+ */
+function readSignatureHeaders(
+  request: Request
+):
+  | { ok: true; id: string; timestamp: string; signatures: string[] }
+  | { ok: false; reason: string } {
   const id = request.headers.get("webhook-id");
   const timestamp = request.headers.get("webhook-timestamp");
   const signatureHeader = request.headers.get("webhook-signature");
@@ -95,18 +151,38 @@ async function verifyFathomSignature(
   if (!id || !timestamp || !signatureHeader) {
     return { ok: false, reason: "missing signature headers" };
   }
-
   const ts = Number(timestamp);
   if (!Number.isFinite(ts)) {
     return { ok: false, reason: "malformed webhook-timestamp" };
   }
   const skew = Math.abs(Date.now() / 1000 - ts);
-  if (skew > 300) {
-    return { ok: false, reason: `timestamp skew ${Math.round(skew)}s exceeds 5min` };
+  if (skew > MAX_TIMESTAMP_SKEW_SECONDS) {
+    return {
+      ok: false,
+      reason: `timestamp skew ${Math.round(skew)}s exceeds ${MAX_TIMESTAMP_SKEW_SECONDS}s`,
+    };
   }
 
-  // Svix prefixes the secret with `whsec_`. The actual key bytes are the
-  // base64 decode of everything after that prefix.
+  const signatures = signatureHeader
+    .split(" ")
+    .filter((s) => s.startsWith("v1,"))
+    .map((s) => s.slice(3));
+
+  return { ok: true, id, timestamp, signatures };
+}
+
+/**
+ * Derive the HMAC-SHA256 signature Fathom should have presented for this
+ * payload. The signed content is `${id}.${timestamp}.${rawBody}`, the key
+ * is the base64-decoded body of a `whsec_<base64>` secret (or the raw
+ * UTF-8 bytes if the secret is unprefixed).
+ */
+async function computeExpectedSignature(
+  secret: string,
+  id: string,
+  timestamp: string,
+  rawBody: string
+): Promise<string> {
   const keyMaterial = secret.startsWith("whsec_")
     ? base64Decode(secret.slice("whsec_".length))
     : new TextEncoder().encode(secret);
@@ -120,27 +196,12 @@ async function verifyFathomSignature(
   );
 
   const signedContent = `${id}.${timestamp}.${rawBody}`;
-  const expectedBuf = await crypto.subtle.sign(
+  const sigBuf = await crypto.subtle.sign(
     "HMAC",
     cryptoKey,
     new TextEncoder().encode(signedContent)
   );
-  const expectedSig = base64Encode(new Uint8Array(expectedBuf));
-
-  // Header value is one or more `v1,<sig>` entries separated by spaces.
-  const presentedSignatures = signatureHeader
-    .split(" ")
-    .filter((s) => s.startsWith("v1,"))
-    .map((s) => s.slice(3));
-
-  const match = presentedSignatures.some((sig) =>
-    constantTimeEqual(sig, expectedSig)
-  );
-
-  if (!match) {
-    return { ok: false, reason: "signature mismatch" };
-  }
-  return { ok: true, webhookId: id };
+  return base64Encode(new Uint8Array(sigBuf));
 }
 
 async function handleWebhook(request: Request, env: Env): Promise<Response> {

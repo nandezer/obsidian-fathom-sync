@@ -14,6 +14,24 @@ import { logger } from "./utils/logger";
 
 type SyncTrigger = "manual" | "periodic";
 
+/**
+ * Combine queue-drain counts into the polling-sync result so the end-of-
+ * tick toast reflects everything that happened. Returns the polling result
+ * unchanged when there's no queue contribution.
+ */
+function mergeSyncResults(
+  polling: SyncResult,
+  queue: SyncResult | null
+): SyncResult {
+  if (!queue) return polling;
+  return {
+    summariesCreated: polling.summariesCreated + queue.summariesCreated,
+    transcriptsCreated: polling.transcriptsCreated + queue.transcriptsCreated,
+    skipped: polling.skipped + queue.skipped,
+    errors: polling.errors + queue.errors,
+  };
+}
+
 export default class FathomSyncPlugin extends Plugin {
   settings!: FathomSyncSettings;
 
@@ -162,65 +180,66 @@ export default class FathomSyncPlugin extends Plugin {
     const label = mode === "full" ? "full sync" : "sync";
 
     try {
-      // Queue drain first — pulls in webhook-delivered meetings (especially
-      // shared_external_recordings, which polling can't see). Errors here
-      // are logged but don't abort the polling sync that follows; the two
-      // intake paths are independent.
-      const queue = this.buildQueue();
-      let queueResult: SyncResult | null = null;
-      if (queue) {
-        try {
-          queueResult = await this.syncService.drainQueue(queue);
-        } catch (err) {
-          logger.error("Queue drain failed", err);
-          if (trigger === "manual") {
-            const msg = err instanceof Error ? err.message : "unknown error";
-            new Notice(`Fathom Sync: queue drain failed — ${msg}`);
-          }
-        }
-      }
+      const queueResult = await this.drainQueueIfConfigured(trigger);
+      const pollingResult = await this.syncService.performSync(mode);
+      const result = mergeSyncResults(pollingResult, queueResult);
 
-      const result = await this.syncService.performSync(mode);
+      this.surfaceForeignNotesWarningOnce();
 
-      // Merge queue + polling counts so the toast reflects the whole tick.
-      if (queueResult) {
-        result.summariesCreated += queueResult.summariesCreated;
-        result.transcriptsCreated += queueResult.transcriptsCreated;
-        result.skipped += queueResult.skipped;
-        result.errors += queueResult.errors;
-      }
-
-      // CRIT-2: surface Granola / other-plugin collisions once per session
-      // so users understand why their counts look weird.
-      if (
-        !this.warnedAboutForeignNotes &&
-        this.fileSync.foreignFathomNotes > 0
-      ) {
-        this.warnedAboutForeignNotes = true;
-        new Notice(
-          `Fathom Sync: ${this.fileSync.foreignFathomNotes} existing notes ` +
-            `with fathom_id from another plugin were ignored. New copies will ` +
-            `be created for those meetings.`,
-          10000
-        );
-      }
-
-      const msg =
+      new Notice(
         `Fathom Sync: ${label} done — ` +
-        `${result.summariesCreated} summaries, ` +
-        `${result.transcriptsCreated} transcripts created.`;
-      new Notice(msg);
+          `${result.summariesCreated} summaries, ` +
+          `${result.transcriptsCreated} transcripts created.`
+      );
       this.setStatusBar(`Last sync: ${new Date().toLocaleTimeString()}`);
     } catch (err) {
       logger.error(`${label} failed`, err);
       const msg = err instanceof Error ? err.message : "Unknown error";
-      // HIGH-7: suppress toast spam on periodic failures (overnight offline =
-      // 16+ stacked Notices). Status bar stays red so the user still knows.
+      // Suppress toast spam on periodic failures (overnight offline = 16+
+      // stacked Notices). Status bar stays red so the user still knows.
       if (trigger === "manual") {
         new Notice(`Fathom Sync: ${label} failed — ${msg}`);
       }
       this.setStatusBar("Sync failed");
     }
+  }
+
+  /**
+   * Run a queue drain if intake is configured. Errors are logged and
+   * surfaced (manual trigger only) but do not propagate — the polling
+   * sync is independent and should still run.
+   */
+  private async drainQueueIfConfigured(
+    trigger: SyncTrigger
+  ): Promise<SyncResult | null> {
+    const queue = this.buildQueue();
+    if (!queue) return null;
+    try {
+      return await this.syncService.drainQueue(queue);
+    } catch (err) {
+      logger.error("Queue drain failed", err);
+      if (trigger === "manual") {
+        const msg = err instanceof Error ? err.message : "unknown error";
+        new Notice(`Fathom Sync: queue drain failed — ${msg}`);
+      }
+      return null;
+    }
+  }
+
+  /**
+   * Surface Granola / other-plugin fathom_id collisions once per session
+   * so users understand why their counts look weird. No-op afterwards.
+   */
+  private surfaceForeignNotesWarningOnce(): void {
+    if (this.warnedAboutForeignNotes) return;
+    if (this.fileSync.foreignFathomNotes === 0) return;
+    this.warnedAboutForeignNotes = true;
+    new Notice(
+      `Fathom Sync: ${this.fileSync.foreignFathomNotes} existing notes ` +
+        `with fathom_id from another plugin were ignored. New copies will ` +
+        `be created for those meetings.`,
+      10000
+    );
   }
 
   private setStatusBar(text: string): void {

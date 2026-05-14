@@ -1,4 +1,4 @@
-import { App, Notice, PluginSettingTab, Setting } from "obsidian";
+import { App, ButtonComponent, Notice, PluginSettingTab, Setting } from "obsidian";
 import type FathomSyncPlugin from "./main";
 import { FathomApiError } from "./services/fathomApi";
 import { FolderQueue } from "./services/queues/folderQueue";
@@ -308,15 +308,20 @@ export class FathomSyncSettingTab extends PluginSettingTab {
       new Setting(containerEl)
         .setName("Bearer token")
         .setDesc("Shared secret you set when deploying the Worker.")
-        .addText((text) =>
+        .addText((text) => {
+          // Mask so the value isn't readable to anyone glancing at the
+          // user's screen / screen-share / shoulder-surfing. Doesn't
+          // protect against a determined attacker with local FS access
+          // (data.json on disk is unencrypted — tracked in ROADMAP v1.1).
+          text.inputEl.type = "password";
           text
             .setPlaceholder("…")
             .setValue(this.plugin.settings.webhookQueueHttpBearer)
             .onChange(async (value) => {
               this.plugin.settings.webhookQueueHttpBearer = value.trim();
               await this.plugin.saveSettings();
-            })
-        );
+            });
+        });
 
       new Setting(containerEl)
         .setName("Test queue")
@@ -369,101 +374,7 @@ export class FathomSyncSettingTab extends PluginSettingTab {
               this.plugin.settings.registeredWebhookId ? "Re-register" : "Connect"
             )
             .setCta()
-            .onClick(async () => {
-              if (!this.plugin.settings.apiToken) {
-                new Notice("Fathom Sync: enter your API token first.");
-                return;
-              }
-              if (!this.plugin.settings.webhookQueueHttpUrl) {
-                new Notice("Fathom Sync: enter your Worker URL first.");
-                return;
-              }
-              btn.setDisabled(true).setButtonText("Working…");
-              try {
-                const api = this.plugin.getSyncService().api;
-
-                // Delete the existing webhook first so we don't accumulate.
-                if (this.plugin.settings.registeredWebhookId) {
-                  try {
-                    await api.deleteWebhook(
-                      this.plugin.settings.registeredWebhookId
-                    );
-                  } catch (err) {
-                    logger.warn("Old webhook delete failed (continuing)", err);
-                  }
-                }
-
-                const created = await api.createWebhook({
-                  destinationUrl: `${this.plugin.settings.webhookQueueHttpUrl.replace(/\/+$/, "")}/webhook`,
-                });
-
-                this.plugin.settings.registeredWebhookId = created.id;
-                await this.plugin.saveSettings();
-                this.display();
-
-                // The signing secret is the highest-sensitivity value in
-                // the v2 system — it's what the Worker uses to verify every
-                // inbound webhook. We deliberately don't render the full
-                // value in the UI toast (visible to screen-capture, shoulder
-                // surfing, screen recorders). Instead: copy to clipboard
-                // silently, and surface only an obfuscated suffix as proof
-                // that *something* was copied. The user pastes once into
-                // Cloudflare and the value never appears on screen again.
-                let copied = false;
-                try {
-                  await navigator.clipboard.writeText(created.signing_secret);
-                  copied = true;
-                } catch (err) {
-                  logger.warn("Clipboard write failed", err);
-                }
-
-                const tail = created.signing_secret.slice(-6);
-                const obfuscated = `…${tail}`;
-                const action = copied
-                  ? "copied to clipboard"
-                  : "clipboard unavailable — see developer console";
-                if (!copied) {
-                  // Fallback: surface the secret to the console only, NEVER
-                  // the UI. Console requires the user to deliberately open
-                  // devtools — much narrower exposure than a 60s toast.
-                  console.info(
-                    "[Fathom Sync] Webhook signing secret (copy this into Cloudflare " +
-                      "FATHOM_WEBHOOK_SECRET):",
-                    created.signing_secret
-                  );
-                }
-                new Notice(
-                  `Fathom Sync: webhook registered (id ${created.id.slice(0, 8)}…). ` +
-                    `Signing secret ending in ${obfuscated} ${action}. ` +
-                    `Paste it into your Worker's FATHOM_WEBHOOK_SECRET variable.`,
-                  20000
-                );
-              } catch (err) {
-                const status =
-                  err instanceof FathomApiError ? err.status : undefined;
-                const message =
-                  status === 401
-                    ? "invalid API token"
-                    : err instanceof Error
-                    ? err.message
-                    : "unknown error";
-                logger.error("Webhook registration failed", err);
-                new Notice(
-                  `Fathom Sync: webhook registration failed — ${message}`
-                );
-              } finally {
-                // On success path this.display() destroys + recreates the
-                // button, so the label doesn't matter. On the error path
-                // we stay on the same DOM node — restore the label too.
-                btn
-                  .setDisabled(false)
-                  .setButtonText(
-                    this.plugin.settings.registeredWebhookId
-                      ? "Re-register"
-                      : "Connect"
-                  );
-              }
-            })
+            .onClick(() => this.handleConnectWebhook(btn))
         );
     }
 
@@ -627,5 +538,109 @@ export class FathomSyncSettingTab extends PluginSettingTab {
           new Notice("Fathom Sync: cursor reset.");
         })
       );
+  }
+
+  /**
+   * Register (or re-register) a webhook with Fathom and stash the signing
+   * secret on the user's clipboard. Extracted from the settings UI block
+   * so it stays under the project's function-length budget and is easier
+   * to reason about as a self-contained operation.
+   */
+  private async handleConnectWebhook(btn: ButtonComponent): Promise<void> {
+    if (!this.plugin.settings.apiToken) {
+      new Notice("Fathom Sync: enter your API token first.");
+      return;
+    }
+    if (!this.plugin.settings.webhookQueueHttpUrl) {
+      new Notice("Fathom Sync: enter your Worker URL first.");
+      return;
+    }
+
+    btn.setDisabled(true).setButtonText("Working…");
+    try {
+      const created = await this.registerWebhook();
+      this.plugin.settings.registeredWebhookId = created.id;
+      await this.plugin.saveSettings();
+      this.display();
+      await this.surfaceSigningSecret(created.id, created.signing_secret);
+    } catch (err) {
+      const status = err instanceof FathomApiError ? err.status : undefined;
+      const message =
+        status === 401
+          ? "invalid API token"
+          : err instanceof Error
+          ? err.message
+          : "unknown error";
+      logger.error("Webhook registration failed", err);
+      new Notice(`Fathom Sync: webhook registration failed — ${message}`);
+    } finally {
+      // On success this.display() destroys + recreates the button so this
+      // is harmless. On error we stay on the same DOM node — restore label.
+      btn
+        .setDisabled(false)
+        .setButtonText(
+          this.plugin.settings.registeredWebhookId ? "Re-register" : "Connect"
+        );
+    }
+  }
+
+  /**
+   * Delete any prior webhook (best-effort) and create a new one pointing
+   * at the configured Worker URL. The /webhook path is appended here so
+   * users don't have to remember to include it in the setting.
+   */
+  private async registerWebhook(): Promise<{ id: string; signing_secret: string }> {
+    const api = this.plugin.getSyncService().api;
+    if (this.plugin.settings.registeredWebhookId) {
+      try {
+        await api.deleteWebhook(this.plugin.settings.registeredWebhookId);
+      } catch (err) {
+        logger.warn("Old webhook delete failed (continuing)", err);
+      }
+    }
+    return api.createWebhook({
+      destinationUrl: `${this.plugin.settings.webhookQueueHttpUrl.replace(/\/+$/, "")}/webhook`,
+    });
+  }
+
+  /**
+   * The signing secret is the highest-sensitivity value in v2 — it's the
+   * HMAC key the Worker uses to verify every inbound webhook. We never
+   * render it in the UI. Strategy:
+   *  1. Try clipboard write. If it succeeds, show only the last 6 chars
+   *     plus "(copied to clipboard)" in a 20-second Notice.
+   *  2. If clipboard fails (Linux without xclip, sandboxed contexts),
+   *     log the full secret via the project logger so it lands in the
+   *     devtools console — narrower exposure than a UI toast, and the
+   *     user must deliberately open devtools to see it.
+   */
+  private async surfaceSigningSecret(
+    webhookId: string,
+    secret: string
+  ): Promise<void> {
+    let copied = false;
+    try {
+      await navigator.clipboard.writeText(secret);
+      copied = true;
+    } catch (err) {
+      logger.warn("Clipboard write failed", err);
+    }
+    if (!copied) {
+      logger.warn(
+        "Webhook signing secret (paste into Cloudflare FATHOM_WEBHOOK_SECRET):",
+        secret
+      );
+    }
+
+    const obfuscated = `…${secret.slice(-6)}`;
+    const action = copied
+      ? "copied to clipboard"
+      : "clipboard unavailable — see developer console";
+    new Notice(
+      `Fathom Sync: webhook registered (id ${webhookId.slice(0, 8)}…). ` +
+        `Signing secret ending in ${obfuscated} ${action}. ` +
+        `Paste it into your Worker's FATHOM_WEBHOOK_SECRET variable.`,
+      20000
+    );
   }
 }

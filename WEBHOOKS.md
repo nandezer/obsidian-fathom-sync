@@ -26,13 +26,24 @@ Cloudflare Workers' free tier covers 100,000 requests/day. For typical use (a fe
 
 ### 1. Deploy the Worker
 
-Click the **Deploy to Cloudflare** button below. Cloudflare will fork the Worker repo into your GitHub account and walk you through a 3-screen deploy in your Cloudflare dashboard.
+Click the **Deploy to Cloudflare** button below. Cloudflare will fork the Worker repo into your GitHub account and walk you through a deploy in your Cloudflare dashboard.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/nandezer/obsidian-fathom-sync/tree/main/worker)
 
-When prompted by Cloudflare, set two variables:
-- `PLUGIN_BEARER_TOKEN` — generate a random string (e.g. `openssl rand -hex 32`). The plugin will paste this in the `Authorization: Bearer …` header.
-- `FATHOM_WEBHOOK_SECRET` — leave blank or set to a placeholder for now; you'll fill it in at step 3.
+The deploy will succeed but the Worker will respond with **503 worker_not_configured** until you set the two secrets. This is deliberate — secrets should never be configured via `[vars]` (where they'd be visible in the dashboard and committed to your fork). Instead, set them via the secrets store.
+
+After deploy, open Cloudflare dashboard → your Worker → **Settings → Variables and Secrets** and add **two secrets**:
+
+| Name | Value | Notes |
+|------|-------|-------|
+| `PLUGIN_BEARER_TOKEN` | a random string you generate (e.g. `openssl rand -hex 32`) | The plugin will present this in `Authorization: Bearer …` when polling. |
+| `FATHOM_WEBHOOK_SECRET` | leave as `placeholder-set-after-connect` for now | You'll replace this in step 3 with the value Fathom returns. |
+
+Or via CLI if you have `wrangler` installed:
+```bash
+echo "$(openssl rand -hex 32)" | wrangler secret put PLUGIN_BEARER_TOKEN
+echo "placeholder-set-after-connect" | wrangler secret put FATHOM_WEBHOOK_SECRET
+```
 
 At the end of deploy you'll get a URL like `https://obsidian-fathom-sync.<your-subdomain>.workers.dev`. Copy it.
 
@@ -58,9 +69,15 @@ FATHOM_WEBHOOK_SECRET variable.
 ### 3. Tell the Worker the signing secret
 
 Cloudflare dashboard → your Worker → **Settings → Variables and Secrets**:
-- Edit `FATHOM_WEBHOOK_SECRET`
-- Paste the `whsec_…` value from step 2
+- Edit the `FATHOM_WEBHOOK_SECRET` **secret** (not a var)
+- Paste the `whsec_…` value the plugin just copied to your clipboard
 - Save & deploy
+
+Or via CLI:
+```bash
+wrangler secret put FATHOM_WEBHOOK_SECRET
+# (paste the whsec_ value when prompted)
+```
 
 Done.
 
@@ -97,7 +114,10 @@ Each delivery includes the full summary, transcript, action items, and meeting m
 The bearer token in the plugin doesn't match the one in the Worker. Re-check both, save the plugin setting, hit Test again.
 
 **Webhook arrives but plugin reports "0 pending deliveries"**
-The Worker is rejecting the signature. Check Worker logs — most likely `FATHOM_WEBHOOK_SECRET` doesn't match the secret Fathom returned in step 2. Re-paste it in Cloudflare.
+The Worker is rejecting the signature. Check Worker logs — most likely `FATHOM_WEBHOOK_SECRET` doesn't match the secret Fathom returned in step 2. Re-set the secret in Cloudflare (Settings → Variables and Secrets, not a plain var).
+
+**Plugin says Worker returns 503 worker_not_configured**
+The Worker is up but one or both of its secrets are missing. Set both `PLUGIN_BEARER_TOKEN` and `FATHOM_WEBHOOK_SECRET` via the Cloudflare Secrets store (not `[vars]`), then redeploy.
 
 **Plugin says "webhook registration failed: invalid API token"**
 Your Fathom API token is wrong or expired. Open Fathom → Customize → API Access and regenerate.
@@ -113,7 +133,7 @@ Your Fathom API token is wrong or expired. Open Fathom → Customize → API Acc
 
 If you suspect the bearer token leaked:
 1. Generate a new random string.
-2. Cloudflare → Worker → Variables → update `PLUGIN_BEARER_TOKEN`.
+2. Cloudflare → Worker → Settings → Variables and Secrets → edit the `PLUGIN_BEARER_TOKEN` **secret** (or `wrangler secret put PLUGIN_BEARER_TOKEN`).
 3. Plugin settings → Bearer token → paste new value → save.
 
 The webhook signing secret doesn't need rotating — Fathom controls it and it's already scoped to one webhook.
