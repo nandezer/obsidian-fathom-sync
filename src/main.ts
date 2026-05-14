@@ -75,6 +75,30 @@ export default class FathomSyncPlugin extends Plugin {
 
     this.addSettingTab(new FathomSyncSettingTab(this.app, this));
 
+    // One-click webhook setup via custom URI scheme:
+    //   obsidian://fathom-sync?worker=https://…&bearer=<token>
+    // Lets users paste a single URL (from a Worker /setup-url helper, or
+    // hand-crafted) instead of typing three fields. We deliberately do
+    // NOT auto-click Connect — the user still confirms in settings.
+    this.registerObsidianProtocolHandler("fathom-sync", async (params) => {
+      const worker = (params.worker ?? "").trim();
+      const bearer = (params.bearer ?? "").trim();
+      if (!worker || !bearer) {
+        new Notice(
+          "Fathom Sync: setup link missing worker= or bearer= params."
+        );
+        return;
+      }
+      this.settings.webhookQueueType = "http";
+      this.settings.webhookQueueHttpUrl = worker.replace(/\/+$/, "");
+      this.settings.webhookQueueHttpBearer = bearer;
+      await this.saveSettings();
+      new Notice(
+        "Fathom Sync: Worker URL + bearer imported. Open settings → Webhook intake → Test queue to verify."
+      );
+      logger.info("Imported webhook config via obsidian:// URI");
+    });
+
     this.reschedulePeriodicSync();
 
     logger.info("Plugin loaded.");

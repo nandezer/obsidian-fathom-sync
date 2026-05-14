@@ -90,7 +90,35 @@ export class FathomSyncSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl("h2", { text: "Fathom Sync" });
+    // Header: name + version label + manual reload. Surfaces the actual
+    // running version so users can confirm a fresh bundle loaded (the
+    // Community Plugins list caches the version label and can lag).
+    const header = containerEl.createDiv({
+      attr: { style: "display: flex; align-items: baseline; gap: 0.75em;" },
+    });
+    header.createEl("h2", { text: "Fathom Sync" });
+    header.createEl("span", {
+      text: `v${this.plugin.manifest.version}`,
+      attr: { style: "font-size: 0.85em; color: var(--text-muted);" },
+    });
+    header.createEl("button", {
+      text: "Reload plugin",
+      attr: { style: "margin-left: auto; font-size: 0.85em;" },
+    }).onclick = async () => {
+      const id = this.plugin.manifest.id;
+      // Obsidian exposes plugin manager via app.plugins.disablePlugin/
+      // enablePlugin. This is a public API but not in the published .d.ts;
+      // we cast to any narrowly here.
+      const plugins = (this.app as unknown as {
+        plugins: {
+          disablePlugin(id: string): Promise<void>;
+          enablePlugin(id: string): Promise<void>;
+        };
+      }).plugins;
+      new Notice("Fathom Sync: reloading…");
+      await plugins.disablePlugin(id);
+      await plugins.enablePlugin(id);
+    };
 
     // ── Authentication ──────────────────────────────────────────────────
     containerEl.createEl("h3", { text: "Authentication" });
@@ -307,6 +335,16 @@ export class FathomSyncSettingTab extends PluginSettingTab {
         cls: "setting-item-description",
       });
 
+      // Debounce re-rendering: as the user types Worker URL or Bearer the
+      // Connect button below should un-grey once both are non-empty. We
+      // re-render the whole panel on blur via a short debounce so we don't
+      // re-render after every keystroke (which would lose focus).
+      let connectGateTimer: number | null = null;
+      const refreshConnectGate = () => {
+        if (connectGateTimer !== null) window.clearTimeout(connectGateTimer);
+        connectGateTimer = window.setTimeout(() => this.display(), 600);
+      };
+
       new Setting(httpBlock)
         .setName("Worker URL")
         .setDesc("Base URL of your Cloudflare Worker (no trailing slash).")
@@ -317,6 +355,7 @@ export class FathomSyncSettingTab extends PluginSettingTab {
             .onChange(async (value) => {
               this.plugin.settings.webhookQueueHttpUrl = value.trim();
               await this.plugin.saveSettings();
+              refreshConnectGate();
             })
         );
 
@@ -326,8 +365,7 @@ export class FathomSyncSettingTab extends PluginSettingTab {
         .addText((text) => {
           // Mask so the value isn't readable to anyone glancing at the
           // user's screen / screen-share / shoulder-surfing. Doesn't
-          // protect against a determined attacker with local FS access
-          // (data.json on disk is unencrypted — tracked in ROADMAP v1.1).
+          // protect against a determined attacker with local FS access.
           text.inputEl.type = "password";
           text
             .setPlaceholder("…")
@@ -335,6 +373,7 @@ export class FathomSyncSettingTab extends PluginSettingTab {
             .onChange(async (value) => {
               this.plugin.settings.webhookQueueHttpBearer = value.trim();
               await this.plugin.saveSettings();
+              refreshConnectGate();
             });
         });
 
@@ -370,6 +409,18 @@ export class FathomSyncSettingTab extends PluginSettingTab {
           })
         );
 
+      // Connect button: greyed out with an explicit hint when prerequisites
+      // aren't met, so users don't click into a generic "enter X first"
+      // Notice without knowing which field needed setting.
+      const missing: string[] = [];
+      if (!this.plugin.settings.apiToken.trim()) missing.push("API token");
+      if (!this.plugin.settings.webhookQueueHttpUrl.trim()) missing.push("Worker URL");
+      if (!this.plugin.settings.webhookQueueHttpBearer.trim()) missing.push("Bearer token");
+      const blockerDesc =
+        missing.length > 0
+          ? `Disabled — fill in: ${missing.join(", ")}.`
+          : null;
+
       new Setting(httpBlock)
         .setName(
           this.plugin.settings.registeredWebhookId
@@ -377,20 +428,22 @@ export class FathomSyncSettingTab extends PluginSettingTab {
             : "Connect (register webhook with Fathom)"
         )
         .setDesc(
-          this.plugin.settings.registeredWebhookId
-            ? `Currently registered as webhook ${this.plugin.settings.registeredWebhookId.slice(0, 8)}…. ` +
-                "Click to delete it and create a new one against the current Worker URL."
-            : "One-shot: tells Fathom to POST every new meeting (yours + shared) to your Worker. " +
-                "Fathom returns a signing secret that you must paste into Cloudflare."
+          blockerDesc ??
+            (this.plugin.settings.registeredWebhookId
+              ? `Currently registered as webhook ${this.plugin.settings.registeredWebhookId.slice(0, 8)}…. ` +
+                  "Click to delete it and create a new one against the current Worker URL."
+              : "One-shot: tells Fathom to POST every new meeting (yours + shared) to your Worker. " +
+                  "Fathom returns a signing secret that you must paste into Cloudflare.")
         )
-        .addButton((btn) =>
+        .addButton((btn) => {
           btn
             .setButtonText(
               this.plugin.settings.registeredWebhookId ? "Re-register" : "Connect"
             )
             .setCta()
-            .onClick(() => this.handleConnectWebhook(btn))
-        );
+            .onClick(() => this.handleConnectWebhook(btn));
+          if (missing.length > 0) btn.setDisabled(true);
+        });
 
       // Escape hatch: delete a specific Fathom webhook by id. Useful when an
       // older plugin version crashed mid-Connect and left orphans on the
