@@ -104,7 +104,7 @@ export class FathomSyncSettingTab extends PluginSettingTab {
     header.createEl("button", {
       text: "Reload plugin",
       attr: { style: "margin-left: auto; font-size: 0.85em;" },
-    }).onclick = async () => {
+    }).onclick = () => {
       const id = this.plugin.manifest.id;
       // Obsidian exposes plugin manager via app.plugins.disablePlugin/
       // enablePlugin. This is a public API but not in the published .d.ts;
@@ -115,9 +115,30 @@ export class FathomSyncSettingTab extends PluginSettingTab {
           enablePlugin(id: string): Promise<void>;
         };
       }).plugins;
+      // Close the Settings modal first. disablePlugin() tears down this
+      // FathomSyncSettingTab instance — if we keep awaiting from inside it,
+      // the containerEl unmounts mid-flight and the user sees a blank pane.
+      // Closing up front lets Obsidian re-register the fresh tab cleanly;
+      // the user reopens Settings → Fathom Sync to see the reloaded UI.
+      const setting = (this.app as unknown as {
+        setting?: { close?: () => void };
+      }).setting;
+      setting?.close?.();
       new Notice("Fathom Sync: reloading…");
-      await plugins.disablePlugin(id);
-      await plugins.enablePlugin(id);
+      // Defer to next tick so the modal close completes before teardown.
+      setTimeout(async () => {
+        try {
+          await plugins.disablePlugin(id);
+          await plugins.enablePlugin(id);
+          new Notice("Fathom Sync: reloaded.");
+        } catch (err) {
+          new Notice(
+            `Fathom Sync: reload failed — ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
+        }
+      }, 0);
     };
 
     // ── Authentication ──────────────────────────────────────────────────
