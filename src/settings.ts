@@ -642,6 +642,48 @@ export class FathomSyncSettingTab extends PluginSettingTab {
           })
       );
 
+    // Import a single meeting from a Fathom URL or recording id. Sits inside
+    // "Actions" because it's a one-off trigger, not a configuration setting.
+    let importInputEl: HTMLInputElement | null = null;
+    new Setting(containerEl)
+      .setName("Import from link")
+      .setDesc(
+        "Paste a Fathom recording ID or meeting URL to import a single meeting. " +
+          "If the meeting isn't in your account's list, a stub note is created " +
+          "with today's date and no attendee metadata."
+      )
+      .addText((text) => {
+        text.setPlaceholder("145099015 or fathom.video/calls/…");
+        importInputEl = text.inputEl;
+        // Make the input wide enough to hold a full share URL without the
+        // user having to scroll inside the field.
+        text.inputEl.style.width = "20em";
+      })
+      .addButton((btn) =>
+        btn
+          .setButtonText("Import")
+          .setCta()
+          .onClick(async () => {
+            // Don't guard on empty here — pass through to the parser so the
+            // user sees a single source of truth for parse feedback (via the
+            // `empty` ParseFailure branch in noticeImportError).
+            const value = importInputEl?.value ?? "";
+            btn.setDisabled(true).setButtonText("Importing…");
+            try {
+              await this.plugin.importByLink(value);
+              // Clear only on success — preserve on failure so the user can
+              // edit/retry without re-pasting.
+              if (importInputEl) importInputEl.value = "";
+            } catch (err) {
+              // runImport / importByLink have already emitted a directed
+              // Notice. Just log for the console reader.
+              logger.error("Import failed", err);
+            } finally {
+              btn.setDisabled(false).setButtonText("Import");
+            }
+          })
+      );
+
     new Setting(containerEl)
       .setName("Reset sync cursor")
       .setDesc(

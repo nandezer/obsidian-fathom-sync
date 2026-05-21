@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Obsidian Fathom Sync — Implementation Notes</title>
+  <style>
+    body { font: 14px/1.55 -apple-system, system-ui, "Segoe UI", sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+    h1, h2, h3 { font-weight: 600; }
+    h1 { border-bottom: 2px solid #ddd; padding-bottom: .25rem; }
+    h2 { margin-top: 2.5rem; border-bottom: 1px solid #eee; padding-bottom: .2rem; }
+    h3 { margin-top: 1.5rem; color: #444; }
+    code { background: #f4f4f4; padding: 1px 4px; border-radius: 3px; }
+    .entry-meta { color: #777; font-size: 13px; margin-bottom: .5rem; }
+    .label { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; }
+    .label.decision { background: #e8f0fe; color: #1a56c4; }
+    .label.deviation { background: #fff1e6; color: #ad4e00; }
+    .label.tradeoff { background: #efe6ff; color: #5b30a6; }
+    .label.open { background: #ffe6e6; color: #b00020; }
+    ul { padding-left: 1.5rem; }
+    li { margin-bottom: .35rem; }
+  </style>
+</head>
+<body>
+
+<h1>Implementation Notes — obsidian-fathom-sync</h1>
+
+<p>A running log of non-trivial design decisions, deviations, tradeoffs, and open questions. Append dated entries; do not rewrite history. See <code>CLAUDE.md</code> §&nbsp;"Running implementation notes" for the policy.</p>
+
+<h2>2026-05-21 — Import meeting from Fathom link</h2>
+<p class="entry-meta">Feature: paste a Fathom URL or recording_id into the settings tab and import that single meeting's summary + transcript as if it were one of yours, even when the recording lives outside your workspace (public share link).</p>
+
+<h3><span class="label decision">Decision</span> Two-tier resolution for arbitrary inputs</h3>
+<p>The plugin's existing sync paths only ingest meetings that appear in <code>/meetings</code>. Single-link import accepts three input forms (numeric <code>recording_id</code>, <code>/calls/{id-or-token}</code> URL, <code>/share/{token}</code> URL) and falls back through up to four resolution paths:</p>
+<ol>
+  <li><strong>Workspace path</strong> — meeting is in the user's filtered <code>/meetings</code> list → process normally with full API content.</li>
+  <li><strong>API stub path</strong> — recording_id is API-accessible (workspace-shared) but excluded by the user's filters → fetch summary + transcript via existing <code>getSummary</code>/<code>getTranscript</code>, write a stub-metadata note tagged <code>import_source: pasted-link</code>.</li>
+  <li><strong>Share-token scrape path</strong> — only the share URL works; <code>/recordings/{id}</code> returns 404 because the recording isn't in the user's account. Scrape the share page's Inertia.js <code>data-page</code> attribute for metadata + lazy-load the AI summary via Inertia partial-data + pull the transcript and action items from the page's signed "copy" URLs. Tagged <code>import_source: shared-link-scraped</code>.</li>
+  <li><strong>Hard error</strong> — token revoked or Fathom changed the share format → directed <code>MeetingNotFoundError</code> / <code>SharedRecordingNotAccessibleError</code> Notice explaining what failed.</li>
+</ol>
+
+<h3><span class="label deviation">Deviation</span> Approved plan said "find in /meetings with NO filters"; shipped uses the user's filters</h3>
+<p>The approved plan ([[plans/i-want-to-add-linear-volcano.md]] at <code>findMeeting</code>) called for an unfiltered <code>/meetings</code> search so the import could match meetings the user's filters exclude. In practice, Fathom's <code>/meetings</code> endpoint returns <strong>HTTP 500 with an HTML error page</strong> when called without any filters on accounts with many recordings. Walking around it by applying the user's existing <code>syncTeams</code>/<code>recordedByFilter</code> filters:</p>
+<ul>
+  <li>Eliminates the 500 (validated empirically against Marc's account, ~292 notes).</li>
+  <li>Reduces the import's blast radius — for recording_ids outside the filter, the list lookup misses cleanly and we fall through to the stub path (which was always going to handle that case anyway).</li>
+  <li>Trade-off: share-token URLs whose target is outside the filter never match in step 1, but step 3 (share-page scrape) handles them, so the user-visible result is unchanged.</li>
+</ul>
+
+<h3><span class="label decision">Decision</span> Share-page scraping uses Inertia.js, not generic HTML parsing</h3>
+<p>Diagnostic logging revealed Fathom's share pages are Inertia.js with component <code>page-call-detail</code>. The full page state is bundled into <code>&lt;div id="app" data-page="…"&gt;</code> as HTML-escaped JSON. Three extraction strategies in <code>fathomApi.ts</code>:</p>
+<ul>
+  <li><code>extractRecordingIdFromShareHtml</code> — three progressive regexes (<code>&lt;link rel="canonical"&gt;</code> → <code>og:url</code> → bare <code>/calls/{n}</code>). Most authoritative first.</li>
+  <li><code>extractInertiaPageData</code> — finds <code>data-page</code>, HTML-decodes, JSON.parses.</li>
+  <li><code>extractScrapedCall</code> — pulls <code>props.call</code> fields (<code>title</code>, <code>byline</code>, <code>started_at</code>, <code>duration_minutes</code>, <code>host.email</code>, <code>company.name</code>, <code>topic</code>).</li>
+</ul>
+
+<h3><span class="label decision">Decision</span> Inertia partial-data probe for the AI summary</h3>
+<p>The initial Inertia props don't include the AI summary — it's a lazy prop. We send a follow-up request to the same share URL with headers <code>X-Inertia: true</code> + <code>X-Inertia-Partial-Component: page-call-detail</code> + <code>X-Inertia-Partial-Data: aiNotes,…</code>. Empirically, Fathom returns <code>aiNotes</code> with shape <code>{ defaultNote: { …, noteText: string, … }, notes, templates, isMeetingTooShortForSummary, … }</code>. The summary markdown is at <code>aiNotes.defaultNote.noteText</code>.</p>
+<p>Walker (<code>extractInertiaSummaryFromValue</code>) checks an ordered set of content-bearing keys including <code>noteText</code>, plus the <code>isMeetingTooShortForSummary</code> flag (surfaces a directed message when Fathom didn't generate a summary). Logs the inner shape on failure so future Fathom schema changes are easy to diagnose without exposing meeting content.</p>
+
+<h3><span class="label decision">Decision</span> Attendees derived from transcript speakers (not the API)</h3>
+<p>Fathom's share-page Inertia props expose only the <code>host</code>, no invitee list. The transcript names every speaker who talked, so <code>deriveAttendeesFromSegments</code> dedupes those into a synthetic <code>FathomInvitee[]</code> with empty <code>email</code>/<code>email_domain</code>. Downstream <code>buildSummaryNote</code> only reads <code>.name</code>, so the stub fields are inert.</p>
+<p>This forced a small refactor in <code>processScrapedSharedImport</code>: the transcript is fetched <em>before</em> the meeting object is constructed, even if <code>syncTranscripts</code> is off. The <code>needTranscript</code> setting now only gates whether the transcript <strong>note</strong> is written; the transcript text itself is always pulled for attendee derivation.</p>
+
+<h3><span class="label decision">Decision</span> <code>noteText</code> anchor-tag conversion</h3>
+<p>Fathom's <code>noteText</code> embeds click-to-jump anchors: <code>&lt;a class='cursor-pointer' data-timestamp="72.0"&gt;text&lt;/a&gt;</code>. These render as plain text clutter in Obsidian. <code>convertFathomNoteTextLinks</code> rewrites each one to <code>[text](https://fathom.video/calls/{id}?timestamp=72)</code> so the click-to-jump still works (browser opens Fathom at the right offset).</p>
+
+<h3><span class="label decision">Decision</span> Single-flight mutex generalised, not refactored</h3>
+<p>The approved plan suggested refactoring <code>triggerSync(mode, trigger)</code> to take a discriminated operation object. Shipped a smaller change instead: a private <code>withMutex(task)</code> helper that returns <code>true</code> if the task ran and <code>false</code> if another op was in flight. Sync callers piggyback (await the existing op — same work); the import caller refuses (the in-flight is a sync, not the import the user asked for, so Notice + abort). Zero blast-radius on the three existing call sites (ribbon, two commands, <code>setInterval</code>).</p>
+
+<h3><span class="label tradeoff">Trade-off</span> Inertia probe vs. content scraping</h3>
+<p>Considered HTML-scraping the rendered share page for summary content. Rejected because the page is a JS-shell SPA (~14KB body) — content only appears after JS runs, which <code>requestUrl</code> can't do. The Inertia partial-data protocol is Fathom's own SSR-bypass; we ride it instead.</p>
+
+<h3><span class="label tradeoff">Trade-off</span> 500 added to retry list</h3>
+<p>Fathom's <code>/meetings</code> endpoint and signed-share-resource endpoints empirically return transient 500s with HTML error bodies that clear on retry (witnessed multiple times during testing). Added 500 to both the API <code>call()</code> retry list and <code>fetchSignedShareResource</code>'s retry list with the same 2s/4s/8s backoff as 5xx. Risk: masks genuine application errors. Mitigation: we don't retry forever (4 attempts max), and the final failure still surfaces the original status.</p>
+
+<h3><span class="label tradeoff">Trade-off</span> Action items endpoint regularly 500s persistently</h3>
+<p>Some meetings' <code>clipboardActionItemsUrl</code> returns 500 on every retry (Fathom backend bug, not transient). Current behaviour: 4× retry, log a warn, write the note without an action-items section. Considered shorter retry but kept full backoff because some 500s ARE transient.</p>
+
+<h3><span class="label decision">Decision</span> Custom error classes with <code>Object.setPrototypeOf</code></h3>
+<p>Defined <code>UrlParseError</code>, <code>MeetingNotFoundError</code>, <code>SharedRecordingNotAccessibleError</code> for directed Notice mapping in <code>main.ts:noticeImportError</code>. Each constructor calls <code>Object.setPrototypeOf(this, X.prototype)</code> as defensive insurance: at tsconfig <code>target: ES2018</code> some downlevels of <code>class extends Error</code> historically lost the prototype chain, breaking <code>instanceof</code>. Existing <code>FathomApiError</code> doesn't do this and works fine in practice (esbuild preserves native class syntax at ES2018), but the cost of adding it is trivial.</p>
+
+<h3><span class="label decision">Decision</span> URL parser is ASCII-strict and length-capped</h3>
+<p><code>src/utils/fathomUrl.ts</code> validates numeric ids with <code>/^[0-9]+$/</code> (not <code>\d</code>, which matches Unicode digits that <code>Number()</code> casts to NaN) and rejects inputs over 500 chars. Token regex character class is <code>[A-Za-z0-9_-]{1,200}</code> — tight enough to prevent ReDoS-style backtracking. 28 unit tests in <code>tests/lib/fathom-url.test.ts</code> cover the boundaries.</p>
+
+<h3><span class="label decision">Decision</span> Settings UI placed in the existing "Actions" section</h3>
+<p>Reviewer feedback (ui-designer) said the import control is a one-off trigger, so it belongs alongside "Run full sync" and "Reset sync cursor", not between "Filters" and "Webhook intake". Followed that. Empty input is no longer guarded in the button — it flows through to <code>parseFathomReference</code> → <code>UrlParseError("empty")</code> → directed Notice, so all parse feedback comes from one source.</p>
+
+<h3><span class="label decision">Decision</span> Command palette opens settings, no Modal</h3>
+<p>Considered shipping a one-input <code>Modal</code> for the command-palette entry. Chose to use Obsidian's internal <code>app.setting.open()</code> + <code>openTabById(this.manifest.id)</code> instead — 4 lines vs ~20 for a Modal subclass. Typed via the new <code>src/obsidian-augments.d.ts</code> module augmentation so there are zero <code>@ts-ignore</code> markers anywhere in <code>src/</code>. Defensive runtime check + Notice fallback if <code>app.setting</code> is unavailable on a future Obsidian version.</p>
+
+<h3><span class="label open">Open question</span> Action-items endpoint persistent 500</h3>
+<p>For the Solidaridad/Planboo test meeting (recording_id 680923773), <code>clipboardActionItemsUrl</code> 500s on every retry. Unclear whether this is meeting-specific (no action items detected → bug returns 500 instead of empty) or a wider Fathom backend issue. To revisit: try a meeting that's known to have action items in the Fathom UI and see if the same URL works.</p>
+
+<h3><span class="label open">Open question</span> Other note templates exposed by <code>aiNotes</code></h3>
+<p><code>aiNotes</code> includes <code>templates: array(16)</code> and <code>notes: array(N)</code>. We only read <code>defaultNote.noteText</code>. If Fathom supports multiple templated notes (e.g. "sales-call summary", "product-review summary"), there may be richer content in <code>notes[*]</code>. Not investigated — the default note's content was sufficient for Marc's needs.</p>
+
+</body>
+</html>

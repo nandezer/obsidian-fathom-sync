@@ -5,11 +5,19 @@ import {
   type FathomSyncSettings,
 } from "./settings";
 import { FileSyncService } from "./services/fileSyncService";
-import { SyncService, type SyncResult } from "./services/syncService";
+import {
+  MeetingNotFoundError,
+  SharedRecordingNotAccessibleError,
+  SyncService,
+  UrlParseError,
+  type SyncResult,
+} from "./services/syncService";
 import { FolderQueue } from "./services/queues/folderQueue";
 import { HttpQueue } from "./services/queues/httpQueue";
 import type { Queue } from "./services/queues/queue";
 import type { SyncMode } from "./types";
+import { parseFathomReference, type ParseFailure } from "./utils/fathomUrl";
+import { FathomApiError } from "./services/fathomApi";
 import { logger } from "./utils/logger";
 
 type SyncTrigger = "manual" | "periodic";
@@ -73,6 +81,12 @@ export default class FathomSyncPlugin extends Plugin {
       callback: () => this.triggerSync("full", "manual"),
     });
 
+    this.addCommand({
+      id: "fathom-sync-import-link",
+      name: "Import meeting from Fathom link",
+      callback: () => this.openImportSettings(),
+    });
+
     this.addSettingTab(new FathomSyncSettingTab(this.app, this));
 
     // One-click webhook setup via custom URI scheme:
@@ -113,6 +127,53 @@ export default class FathomSyncPlugin extends Plugin {
 
   async performSync(mode: SyncMode): Promise<void> {
     await this.triggerSync(mode, "manual");
+  }
+
+  /**
+   * Public entry point for the settings tab's "Import" button. Returns the
+   * resulting counts so the caller can render a precise Notice. On any error
+   * (parse failure, meeting-not-found, API failure, busy mutex) throws — the
+   * caller is responsible for restoring its button state. Directed Notices
+   * for each known failure mode are emitted from `runImport`/`importByLink`
+   * themselves so the user always sees what went wrong.
+   */
+  async importByLink(input: string): Promise<SyncResult> {
+    let result: SyncResult | undefined;
+    const ran = await this.withMutex(async () => {
+      result = await this.runImport(input);
+    });
+    if (!ran) {
+      new Notice(
+        "Fathom Sync: a sync or import is already running. Try again after it finishes."
+      );
+      throw new Error("Another operation in progress");
+    }
+    if (!result) {
+      // runImport always sets `result` before resolving on the happy path.
+      // The only way we reach here is if runImport threw — which propagates
+      // out via the awaited withMutex above, never landing here. Defensive.
+      throw new Error("Import did not produce a result");
+    }
+    return result;
+  }
+
+  /**
+   * Open the settings tab so the user can use the Import-from-link control.
+   * The `app.setting` API is internal (typed via obsidian-augments.d.ts), so
+   * fall back to a Notice if it isn't available on this Obsidian version.
+   */
+  private openImportSettings(): void {
+    const setting = this.app.setting;
+    if (!setting || typeof setting.open !== "function") {
+      new Notice(
+        "Fathom Sync: open Settings → Fathom Sync → Actions and paste your link there."
+      );
+      return;
+    }
+    setting.open();
+    if (typeof setting.openTabById === "function") {
+      setting.openTabById(this.manifest.id);
+    }
   }
 
   reschedulePeriodicSync(): void {
@@ -165,22 +226,122 @@ export default class FathomSyncPlugin extends Plugin {
     this.warnedAboutForeignNotes = false;
   }
 
-  private async triggerSync(mode: SyncMode, trigger: SyncTrigger): Promise<void> {
-    // CRIT-1: single-flight mutex. A second click / interval tick while a
-    // sync is running just awaits the in-flight one.
-    if (this.inFlightSync) {
-      if (trigger === "manual") {
-        new Notice("Fathom Sync: a sync is already running.");
-      }
-      return this.inFlightSync;
-    }
-
-    this.inFlightSync = this.runSync(mode, trigger);
+  /**
+   * Single-flight mutex. Returns `true` if `task` ran (mutex was free),
+   * `false` if another operation was already in flight (task did NOT run;
+   * caller decides whether to Notice / piggyback / abort). Sync callers
+   * piggyback (await the in-flight sync because it's the same work); the
+   * import caller refuses (the in-flight is a sync, not the import the user
+   * asked for).
+   */
+  private async withMutex(task: () => Promise<void>): Promise<boolean> {
+    if (this.inFlightSync) return false;
+    this.inFlightSync = task();
     try {
       await this.inFlightSync;
     } finally {
       this.inFlightSync = null;
     }
+    return true;
+  }
+
+  private async triggerSync(mode: SyncMode, trigger: SyncTrigger): Promise<void> {
+    // CRIT-1: single-flight mutex. A second click / interval tick while a
+    // sync is running just awaits the in-flight one (piggyback) rather than
+    // starting a second sync.
+    const ran = await this.withMutex(() => this.runSync(mode, trigger));
+    if (!ran) {
+      if (trigger === "manual") {
+        new Notice("Fathom Sync: a sync or import is already running.");
+      }
+      if (this.inFlightSync) await this.inFlightSync;
+    }
+  }
+
+  private async runImport(input: string): Promise<SyncResult> {
+    this.setStatusBar("Importing…");
+    try {
+      // Queue drain first so any pending webhook-delivered notes for the same
+      // recording are persisted before we look it up — keeps dedup honest.
+      await this.drainQueueIfConfigured("manual");
+
+      const ref = parseFathomReference(input);
+      const result = await this.syncService.importByReference(ref);
+
+      this.surfaceForeignNotesWarningOnce();
+      new Notice(
+        `Fathom Sync: import done — ${result.summariesCreated} summaries, ` +
+          `${result.transcriptsCreated} transcripts created` +
+          (result.skipped > 0 ? `, ${result.skipped} skipped (already in vault)` : "") +
+          "."
+      );
+      this.setStatusBar(`Last import: ${new Date().toLocaleTimeString()}`);
+      return result;
+    } catch (err) {
+      this.setStatusBar("Import failed");
+      this.noticeImportError(err);
+      throw err;
+    }
+  }
+
+  private noticeImportError(err: unknown): void {
+    if (err instanceof UrlParseError) {
+      new Notice(`Fathom Sync: ${importParseFailureMessage(err.reason)}`);
+      return;
+    }
+    if (err instanceof MeetingNotFoundError) {
+      if (err.kind === "share_token") {
+        new Notice(
+          "Fathom Sync: could not resolve share token — only recordings " +
+            "visible to your API token can be imported. Ask the owner to " +
+            "share the recording with your Fathom workspace or paste the " +
+            "recording id instead."
+        );
+      } else {
+        new Notice("Fathom Sync: meeting not found.");
+      }
+      return;
+    }
+    if (err instanceof SharedRecordingNotAccessibleError) {
+      new Notice(
+        `Fathom Sync: recording ${err.recordingId} is viewable in browser via the share link, ` +
+          "but Fathom's API doesn't grant your token access to it. Ask the meeting owner " +
+          "to share the recording with your Fathom workspace (not just a public link) so " +
+          "it becomes API-accessible.",
+        15000
+      );
+      return;
+    }
+    if (err instanceof FathomApiError) {
+      if (err.status === 401) {
+        new Notice("Fathom Sync: invalid API token. Check your settings.");
+        return;
+      }
+      if (err.status === 403 || err.status === 404) {
+        new Notice(
+          "Fathom Sync: this recording isn't accessible to your API token " +
+            "(404/403). Ask the owner to share it with your workspace."
+        );
+        return;
+      }
+      if (err.status >= 500) {
+        new Notice(
+          `Fathom Sync: Fathom returned HTTP ${err.status} (server-side error). ` +
+            "Try again in a minute. If it persists, narrow your sync filters and retry."
+        );
+        return;
+      }
+      new Notice(`Fathom Sync: import failed (HTTP ${err.status}).`);
+      return;
+    }
+    const msg = err instanceof Error ? err.message : "unknown error";
+    // performSync / importByReference / importByLink emit their own Notices
+    // for missing-token and no-content-enabled — don't double-Notice those.
+    if (msg === "Missing API token" || msg === "No content to import" ||
+        msg === "Another operation in progress") {
+      return;
+    }
+    new Notice(`Fathom Sync: import failed — ${msg}`);
   }
 
   /** Build the configured queue, or null if intake is disabled. */
@@ -276,4 +437,25 @@ export default class FathomSyncPlugin extends Plugin {
       this.periodicSyncIntervalId = null;
     }
   }
+}
+
+function importParseFailureMessage(reason: ParseFailure): string {
+  switch (reason) {
+    case "empty":
+      return "paste a Fathom URL or recording id.";
+    case "too_long":
+      return "input is too long — paste only the Fathom URL or id.";
+    case "unrecognised_scheme":
+      return "that URL doesn't look like a Fathom link. Paste a fathom.video/calls/… or /share/… URL, or a recording id.";
+    case "no_recognisable_id":
+      return "couldn't find a Fathom recording id or URL in that input.";
+    default:
+      // Exhaustiveness check: adding a new ParseFailure literal without
+      // updating this switch will fail compilation here.
+      return assertNever(reason);
+  }
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unhandled ParseFailure variant: ${String(value)}`);
 }

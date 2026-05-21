@@ -38,7 +38,8 @@ export class DocumentProcessor {
   buildSummaryNote(
     meeting: FathomMeeting,
     summary: FathomSummary,
-    transcriptPath?: string
+    transcriptPath?: string,
+    extraFrontmatter?: Record<string, string>
   ): ProcessedNote {
     const filename = this.buildFilename(meeting);
     const folder = this.settings.summaryFolder;
@@ -63,6 +64,7 @@ export class DocumentProcessor {
       `synced_by: fathom-sync`,
       `type: summary`,
       transcriptPath ? `transcript: ${yamlString(`[[${transcriptPath}]]`)}` : null,
+      ...buildExtraFrontmatterLines(extraFrontmatter),
       "---",
     ]
       .filter((line) => line !== null)
@@ -86,7 +88,8 @@ export class DocumentProcessor {
   buildTranscriptNote(
     meeting: FathomMeeting,
     segments: FathomTranscriptSegment[],
-    summaryPath: string
+    summaryPath: string,
+    extraFrontmatter?: Record<string, string>
   ): ProcessedNote {
     const filename = this.buildFilename(meeting);
     const folder = this.settings.transcriptFolder;
@@ -100,6 +103,7 @@ export class DocumentProcessor {
       `synced_by: fathom-sync`,
       `note: ${yamlString(`[[${summaryPath}]]`)}`,
       `synced_at: ${yamlString(nowIso())}`,
+      ...buildExtraFrontmatterLines(extraFrontmatter),
       "---",
     ].join("\n");
 
@@ -134,6 +138,30 @@ export class DocumentProcessor {
 function yamlString(value: string): string {
   const safe = value.replace(/'/g, "''");
   return `'${safe}'`;
+}
+
+const FRONTMATTER_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * Render caller-supplied frontmatter pairs as `key: 'value'` lines. Skips any
+ * key that doesn't match a strict identifier shape (would otherwise let a
+ * caller break out of the YAML block with `:` or newline in the key), and
+ * escapes literal newlines in values (YAML 1.2 single-quoted scalars preserve
+ * `\n` literally, which would split the frontmatter prematurely).
+ */
+function buildExtraFrontmatterLines(
+  extra?: Record<string, string>
+): string[] {
+  if (!extra) return [];
+  const lines: string[] = [];
+  for (const [key, rawValue] of Object.entries(extra)) {
+    if (!FRONTMATTER_KEY_RE.test(key)) continue;
+    // Replace any line break form — \r\n, lone \n, or bare \r — so a value
+    // can't span lines and break out of the YAML scalar.
+    const value = String(rawValue ?? "").replace(/\r\n|\r|\n/g, "\\n");
+    lines.push(`${key}: ${yamlString(value)}`);
+  }
+  return lines;
 }
 
 function speakerToString(speaker: unknown): string {
