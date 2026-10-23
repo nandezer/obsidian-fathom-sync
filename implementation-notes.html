@@ -95,5 +95,16 @@
 <h3><span class="label open">Open question</span> Other note templates exposed by <code>aiNotes</code></h3>
 <p><code>aiNotes</code> includes <code>templates: array(16)</code> and <code>notes: array(N)</code>. We only read <code>defaultNote.noteText</code>. If Fathom supports multiple templated notes (e.g. "sales-call summary", "product-review summary"), there may be richer content in <code>notes[*]</code>. Not investigated — the default note's content was sufficient for Marc's needs.</p>
 
+<h2>2026-10-24: Sync on startup</h2>
+
+<h3><span class="label decision">Decision</span> One catch-up sync when the workspace layout is ready</h3>
+<p>The only automatic sync was the periodic <code>setInterval</code>, which first fires one interval (60 min) after load. Obsidian was closed 21 to 24 Oct; five meetings waited and would still have waited an hour after reopening. <code>src/utils/startupSync.ts</code> schedules one <code>triggerSync("standard", "periodic")</code> via <code>workspace.onLayoutReady</code>, so it goes through the mutex and the vault cache is built first.</p>
+
+<h3><span class="label decision">Decision</span> Runs even when periodic sync is off; skipped with no token</h3>
+<p>Marc 2026-10-24 chose "Always on startup" over gating on <code>periodicSyncEnabled</code>. Skipped only when <code>apiToken</code> is blank so a fresh install does not show "Sync failed".</p>
+
+<h3><span class="label decision">Decision</span> Startup failures are silent</h3>
+<p>Uses the <code>"periodic"</code> trigger, so an offline launch only turns the status bar red, same as the hourly tick (Marc 2026-10-24).</p>
+
 </body>
 </html>

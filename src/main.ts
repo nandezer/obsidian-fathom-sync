@@ -19,6 +19,7 @@ import type { SyncMode } from "./types";
 import { parseFathomReference, type ParseFailure } from "./utils/fathomUrl";
 import { FathomApiError } from "./services/fathomApi";
 import { logger } from "./utils/logger";
+import { scheduleStartupSync } from "./utils/startupSync";
 
 type SyncTrigger = "manual" | "periodic";
 
@@ -114,6 +115,14 @@ export default class FathomSyncPlugin extends Plugin {
     });
 
     this.reschedulePeriodicSync();
+
+    // Catch-up sync on launch. Uses the "periodic" trigger so an offline
+    // start fails silently (status bar only), like the hourly tick.
+    scheduleStartupSync(
+      this.settings.apiToken,
+      (cb) => this.app.workspace.onLayoutReady(cb),
+      () => this.triggerSync("standard", "periodic")
+    );
 
     logger.info("Plugin loaded.");
   }
